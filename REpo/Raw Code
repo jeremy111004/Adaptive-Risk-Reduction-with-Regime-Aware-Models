@@ -1,0 +1,1965 @@
+#!/usr/bin/env python3
+# Test 2/5 — PCA-HMM (cross-asset structure, hard regimes) — FAIR VERSION + SAFE TURNOVER PLOT
+# -------------------------------------------------------------------------
+# Your requests:
+# - Keep original (non-causal) regime weights estimation (uses full-sample labels) ✅
+# Kept fixes:
+# - Constant-vol Risk-Parity baseline (IVP, rolling)
+# - Risk-matched (target-vol) headline table @10% vol
+# - Net-of-costs with turnover + cost grid (5/10/25/50 bps)
+# - Subperiod panels (2000–09 / 2010–19 / 2020–25)
+# - ES95 metric; data manifest
+# - SAFE turnover distribution plot (histogram/spike fallback; no SciPy KDE)
+# -------------------------------------------------------------------------
+
+import os, glob, warnings
+warnings.filterwarnings("ignore")
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ---------------- Config ----------------
+DATA_DIR     = "./data2"
+OUT_DIR      = "./out1"
+K            = 3
+ROLL_PC_WIN  = 63          # window for PCA feature (covariance)
+ROLL_FIT_N   = 500         # HMM fit window (days)
+REFIT_EVERY  = 5
+RIDGE        = 1e-6
+CLIP         = 0.5
+SEED         = 7
+
+# Reporting / fairness
+TARGET_VOL    = 0.10       # annualized target vol for matched-vol table
+COST_BPS_GRID = [5, 10, 25, 50]
+IVP_WIN       = 63         # lookback for inverse-vol baseline
+IVP_REBAL     = 21         # rebalance every N trading days
+
+try:
+    from hmmlearn.hmm import GaussianHMM
+except Exception as e:
+    raise SystemExit("pip install hmmlearn\nOriginal error: %r" % e)
+
+np.random.seed(SEED)
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# --------------- Helpers ----------------
+def load_data_from_dir(data_dir: str) -> pd.DataFrame:
+    files = sorted(glob.glob(os.path.join(data_dir, "*.csv")))
+    if not files:
+        raise FileNotFoundError(f"No CSVs found in {data_dir}")
+    frames = []
+    for f in files:
+        tkr = os.path.splitext(os.path.basename(f))[0].upper()
+        df = pd.read_csv(f)
+        if "Date" not in df.columns and "date" in df.columns:
+            df.rename(columns={"date": "Date"}, inplace=True)
+        close_col = None
+        for c in ["Close", "Adj Close", "close", "adj_close", "AdjClose"]:
+            if c in df.columns:
+                close_col = c; break
+        if close_col is None and "Zamkniecie" in df.columns:
+            close_col = "Zamkniecie"
+        if close_col is None:
+            print(f"Skipping {tkr}: no Close/Adj Close column.")
+            continue
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df[["Date", close_col]].dropna()
+        df.rename(columns={close_col: tkr}, inplace=True)
+        frames.append(df)
+    if not frames:
+        raise ValueError("No usable files with Close prices.")
+    out = frames[0]
+    for df in frames[1:]:
+        out = out.merge(df, on="Date", how="outer")
+    out.sort_values("Date", inplace=True)
+    out.set_index("Date", inplace=True)
+    return out
+
+def to_log_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    return np.log(prices/prices.shift(1))
+
+def mean_var_weights(mu: np.ndarray, Sigma: np.ndarray, ridge=1e-6, clip=0.5):
+    n = len(mu)
+    S = Sigma + ridge*np.eye(n)
+    w = np.linalg.pinv(S).dot(mu.reshape(-1,1)).ravel()
+    w = w/np.abs(w).sum() if np.abs(w).sum()>0 else np.ones(n)/n
+    w = np.clip(w, -clip, clip)
+    w = w/np.abs(w).sum() if np.abs(w).sum()>0 else np.ones(n)/n
+    return w
+
+def ann_kpis_from_returns(rets: pd.Series, freq=252):
+    rets = rets.dropna()
+    if rets.empty:
+        return dict(ret=np.nan, vol=np.nan, sharpe=np.nan, maxdd=np.nan, es95=np.nan)
+    curve = (1+rets).cumprod()
+    maxdd = (curve/curve.cummax()-1).min()
+    ann_ret = (1+rets).prod()**(freq/len(rets)) - 1
+    ann_vol = rets.std()*np.sqrt(freq)
+    sharpe = ann_ret/ann_vol if ann_vol>0 else np.nan
+    q = np.quantile(rets, 0.05)
+    es95 = -rets[rets<=q].mean() if (rets<=q).any() else np.nan
+    return dict(ret=ann_ret, vol=ann_vol, sharpe=sharpe, maxdd=maxdd, es95=es95)
+
+def pca_pc1_var_feature(R: pd.DataFrame, win=63):
+    """Return:
+       - pc1_share_series: log(PC1 variance share) indexed by the *window end* date
+       - last_loadings: PC1 eigenvector (unit length) from the *last* window (for plotting)
+    """
+    from numpy.linalg import eigh
+    vals, idxs = [], []
+    last_loadings = None
+    last_cols = R.columns
+    for i in range(win-1, len(R)):
+        X = R.iloc[i-win+1:i+1].dropna(how="any")
+        if len(X) < win:
+            continue
+        C = X.cov().values
+        evals, evecs = eigh(C)          # ascending order
+        lam1 = float(evals[-1])
+        total = float(evals.sum()) + 1e-12
+        pc1_share = lam1 / total
+        vals.append(np.log(pc1_share + 1e-12))
+        idxs.append(R.index[i])
+        last_loadings = evecs[:, -1]    # associated eigenvector
+        last_cols = X.columns
+    s = pd.Series(vals, index=idxs, name="x_pc1_share_log")
+    return s, (last_cols, last_loadings)
+
+def smooth_drawdown_from_returns(rets: pd.Series):
+    curve = (1+rets.fillna(0)).cumprod()
+    dd = curve/curve.cummax() - 1.0
+    return curve, dd
+
+def inverse_vol_weights(R_window: pd.DataFrame):
+    vol = R_window.std().replace(0, np.nan)
+    w = 1.0/vol
+    w = w.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    if w.sum() > 0:
+        w = w / w.sum()
+    else:
+        w = pd.Series(np.ones(len(R_window.columns))/len(R_window.columns), index=R_window.columns)
+    return w.values
+
+def turnover_series(W: pd.DataFrame):
+    """One-way turnover per day: 0.5 * sum(|w_t - w_{t-1}|)."""
+    Wf = W.fillna(method="ffill").fillna(0.0)
+    dW = (Wf - Wf.shift(1)).abs().sum(axis=1) * 0.5
+    dW.iloc[0] = 0.0
+    return dW
+
+def apply_costs(gross: pd.Series, turnover: pd.Series, cost_bps: float):
+    c = cost_bps/10000.0
+    return gross - c*turnover
+
+def risk_match(rets: pd.Series, target_vol=0.10, freq=252):
+    vol = rets.std()*np.sqrt(freq)
+    if not np.isfinite(vol) or vol<=0:
+        return rets.copy(), 1.0
+    alpha = target_vol/vol
+    return rets*alpha, alpha
+
+# --- ORIGINAL (non-causal) regime weights estimation -------------------
+def regime_weights_from_labels(R: pd.DataFrame, labels: pd.Series, ridge=1e-6, clip=0.5):
+    N = R.shape[1]
+    out = {}
+    for k in sorted(labels.dropna().unique()):
+        idx = labels.index[labels==k]
+        if len(idx) < max(60, N*5):
+            w = np.ones(N)/N
+        else:
+            sub = R.loc[idx]
+            mu = sub.mean().values
+            Sigma = sub.cov().values
+            w = mean_var_weights(mu, Sigma, ridge=ridge, clip=clip)
+        out[int(k)] = w
+    return out
+
+# ---------------- Load & prep ----------------
+prices = load_data_from_dir(DATA_DIR).ffill().dropna(how="all")
+tickers = [c for c in prices.columns if prices[c].notna().sum()>0]
+prices = prices[tickers].dropna()
+R = to_log_returns(prices).dropna()
+N = R.shape[1]
+print(f"Loaded {N} assets: {', '.join(R.columns)}")
+
+# Data manifest (repro)
+manifest = pd.DataFrame({
+    "Ticker": R.columns,
+    "FirstDate": [R.index.min()]*N,
+    "LastDate":  [R.index.max()]*N,
+    "Obs": [R[c].dropna().shape[0] for c in R.columns]
+})
+manifest.to_csv(os.path.join(OUT_DIR, "manifest_pca_hmm.csv"), index=False)
+
+# Feature: log(PC1 variance share)
+x_pc1, (cols_last, loadings_last) = pca_pc1_var_feature(R, win=ROLL_PC_WIN)
+x_df = x_pc1.to_frame()
+R_aligned = R.loc[x_df.index].copy()
+dates = x_df.index
+
+# ---------------- Rolling HMM (labels) ----------------
+labels = pd.Series(index=dates, dtype=int)
+trans_mats = {}
+model = None
+last_fit = None
+
+for i, dt in enumerate(dates):
+    refit = (last_fit is None) or ((i - last_fit) >= REFIT_EVERY)
+    if refit:
+        start_idx = max(0, i - ROLL_FIT_N)
+        fit_slice = x_df.iloc[start_idx:i+1].values
+        if len(fit_slice) < max(120, ROLL_FIT_N//4):
+            labels.iloc[i] = 0
+            continue
+        model = GaussianHMM(n_components=K, covariance_type='diag', n_iter=200, random_state=SEED)
+        model.fit(fit_slice)
+        last_fit = i
+        trans_mats[dt] = model.transmat_.copy()
+
+    start_idx = max(0, i - ROLL_FIT_N)
+    window = x_df.iloc[start_idx:i+1].values
+    path = model.predict(window)
+    labels.iloc[i] = path[-1]
+
+# Remap states calm→mid→stress by feature mean
+means = [(k, x_df.loc[labels==k, "x_pc1_share_log"].mean()) for k in range(K)]
+order = [k for (k, _) in sorted(means, key=lambda z: z[1])]
+remap = {old:new for new, old in enumerate(order)}
+labels = labels.map(remap)
+
+# ---------------- Regime weights (NON-CAUSAL, original) ---------------
+regime_w = regime_weights_from_labels(R_aligned, labels, ridge=RIDGE, clip=CLIP)
+
+# ---------------- Strategy (hard regimes) ------------------------------
+W_dyn = pd.DataFrame(index=R_aligned.index, columns=R_aligned.columns, dtype=float)
+prev_label = None
+for dt in R_aligned.index:
+    if prev_label is None:
+        W_dyn.loc[dt] = np.ones(N)/N
+    else:
+        w = regime_w.get(int(prev_label), np.ones(N)/N)
+        W_dyn.loc[dt] = w
+    prev_label = labels.loc[dt] if pd.notna(labels.loc[dt]) else prev_label
+
+dyn_rets = (R_aligned * W_dyn.shift(1)).sum(axis=1).fillna(0.0)
+dyn_turn = turnover_series(W_dyn)
+
+# ---------------- Baselines -------------------------------------------
+# Static Mean-Var
+Sigma_full   = R_aligned.cov().values
+mu_full      = R_aligned.mean().values
+w_static     = mean_var_weights(mu_full, Sigma_full, ridge=RIDGE, clip=CLIP)
+W_static     = pd.DataFrame([w_static]*len(R_aligned), index=R_aligned.index, columns=R_aligned.columns)
+static_rets  = (R_aligned @ pd.Series(w_static, index=R_aligned.columns)).fillna(0.0)
+static_turn  = turnover_series(W_static)
+
+# Equal-Weight
+ew_w         = np.ones(N)/N
+W_ew         = pd.DataFrame([ew_w]*len(R_aligned), index=R_aligned.index, columns=R_aligned.columns)
+ew_rets      = (R_aligned @ pd.Series(ew_w, index=R_aligned.columns)).fillna(0.0)
+ew_turn      = turnover_series(W_ew)
+
+# Constant-Vol Risk-Parity (IVP), rolling
+W_ivp = pd.DataFrame(index=R_aligned.index, columns=R_aligned.columns, dtype=float)
+for i, dt in enumerate(R_aligned.index):
+    if i < IVP_WIN:
+        W_ivp.iloc[i] = np.ones(N)/N
+    else:
+        if i % IVP_REBAL == 0 or i == IVP_WIN:
+            Rw = R_aligned.iloc[i-IVP_WIN:i]
+            w = inverse_vol_weights(Rw)
+            W_ivp.iloc[i] = w
+        else:
+            W_ivp.iloc[i] = W_ivp.iloc[i-1]
+W_ivp = W_ivp.fillna(method="ffill").fillna(1.0/N)
+ivp_rets = (R_aligned * W_ivp.shift(1)).sum(axis=1).fillna(0.0)
+ivp_turn = turnover_series(W_ivp)
+
+# ---------------- KPIs: native (pre-cost) -----------------------------
+def kpi_row(name, rets):
+    k = ann_kpis_from_returns(rets)
+    return [name, k['ret'], k['vol'], k['sharpe'], k['maxdd'], k['es95']]
+
+kpi_native = pd.DataFrame(
+    [kpi_row('Equal-Weight', ew_rets),
+     kpi_row('Static Mean-Var', static_rets),
+     kpi_row('IVP (Const-Vol RP, rolling)', ivp_rets),
+     kpi_row('PCA-HMM Hard-Regime', dyn_rets)],
+    columns=['Strategy','Ann.Return','Ann.Vol','Sharpe','MaxDD','ES95_day']
+)
+kpi_native_path = os.path.join(OUT_DIR, "kpi_pca_native.csv")
+kpi_native.to_csv(kpi_native_path, index=False)
+print("\n=== KPI (native, pre-cost) ===")
+print(kpi_native.to_string(index=False, float_format=lambda x: f"{x:,.4f}"))
+print(f"Saved → {kpi_native_path}")
+
+# ---------------- Risk-matched (target vol) headline table ------------
+def matched_table(name, rets, turn):
+    rm_rets, alpha = risk_match(rets, TARGET_VOL)
+    row = ann_kpis_from_returns(rm_rets)
+    return name, rm_rets, turn*alpha, alpha, row
+
+rows = []
+matched_series = {}
+turn_series = {}
+alphas = {}
+
+for name, rets, turn in [
+    ('Equal-Weight', ew_rets, ew_turn),
+    ('Static Mean-Var', static_rets, static_turn),
+    ('IVP (Const-Vol RP, rolling)', ivp_rets, ivp_turn),
+    ('PCA-HMM Hard-Regime', dyn_rets, dyn_turn),
+]:
+    nm, rm_rets, rm_turn, alpha, row = matched_table(name, rets, turn)
+    matched_series[nm] = rm_rets
+    turn_series[nm] = rm_turn
+    alphas[nm] = alpha
+    rows.append([nm, row['ret'], row['vol'], row['sharpe'], row['maxdd'], row['es95'], alpha])
+
+kpi_matched = pd.DataFrame(rows, columns=['Strategy','Ann.Return','Ann.Vol','Sharpe','MaxDD','ES95_day','Alpha(scale)'])
+kpi_matched_path = os.path.join(OUT_DIR, "kpi_pca_matchedVol.csv")
+kpi_matched.to_csv(kpi_matched_path, index=False)
+print("\n=== KPI (risk-matched @ {:.0f}%) ===".format(TARGET_VOL*100))
+print(kpi_matched.to_string(index=False, float_format=lambda x: f"{x:,.4f}"))
+print(f"Saved → {kpi_matched_path}")
+
+# ---------------- Net-of-costs grids (on risk-matched) -----------------
+def cost_grid_table(cost_bps_list):
+    out = []
+    for c in cost_bps_list:
+        for name in matched_series:
+            net = apply_costs(matched_series[name], turn_series[name], c)
+            k = ann_kpis_from_returns(net)
+            out.append([c, name, k['ret'], k['vol'], k['sharpe'], k['maxdd'], k['es95']])
+    df = pd.DataFrame(out, columns=['Cost_bps','Strategy','Ann.Return','Ann.Vol','Sharpe','MaxDD','ES95_day'])
+    return df
+
+kpi_costs = cost_grid_table(COST_BPS_GRID)
+kpi_costs_path = os.path.join(OUT_DIR, "kpi_pca_matchedVol_costGrid.csv")
+kpi_costs.to_csv(kpi_costs_path, index=False)
+print(f"\nSaved net-of-costs grid → {kpi_costs_path}")
+
+# ---------------- Turnover stats table ---------------------------------
+turn_stats = []
+for name, ts in turn_series.items():
+    turn_stats.append([name, ts.mean(), ts.median(), ts.quantile(0.9), ts.max()])
+turn_df = pd.DataFrame(turn_stats, columns=['Strategy','Turnover_mean','Turnover_median','Turnover_p90','Turnover_max'])
+turn_df_path = os.path.join(OUT_DIR, "turnover_stats.csv")
+turn_df.to_csv(turn_df_path, index=False)
+print(f"Saved turnover stats → {turn_df_path}")
+
+# ---------------- Subperiod panels (risk-matched, 3 eras) -------------
+def subperiod_slices(idx):
+    eras = [
+        ("2000-01-01","2009-12-31"),
+        ("2010-01-01","2019-12-31"),
+        ("2020-01-01", str(idx.max().date()))
+    ]
+    out = []
+    for s,e in eras:
+        sdt = pd.Timestamp(s); edt = pd.Timestamp(e)
+        mask = (idx>=sdt) & (idx<=edt)
+        if mask.any():
+            out.append((s, e, mask))
+    return out
+
+subs_rows = []
+for (s,e,mask) in subperiod_slices(R_aligned.index):
+    for name in matched_series:
+        rets = matched_series[name].loc[mask]
+        k = ann_kpis_from_returns(rets)
+        subs_rows.append([f"{s}–{e}", name, k['ret'], k['vol'], k['sharpe'], k['maxdd'], k['es95']])
+sub_df = pd.DataFrame(subs_rows, columns=['Period','Strategy','Ann.Return','Ann.Vol','Sharpe','MaxDD','ES95_day'])
+sub_df_path = os.path.join(OUT_DIR, "kpi_pca_matchedVol_subperiods.csv")
+sub_df.to_csv(sub_df_path, index=False)
+print(f"Saved subperiod KPIs → {sub_df_path}")
+
+# ---------------- Figures -------------------
+# SAFE helper: turnover distribution without SciPy KDE
+def plot_turnover_distribution(turn_map, out_path):
+    fig, ax = plt.subplots(figsize=(10,4))
+    for name, ts in turn_map.items():
+        s = pd.Series(ts).replace([np.inf, -np.inf], np.nan).dropna()
+        s = s[np.isfinite(s)]
+        if (len(s) == 0) or (s.std() <= 1e-12) or (s.nunique() < 3):
+            val = float(s.iloc[0]) if len(s) else 0.0
+            ax.axvline(val, linestyle="--", linewidth=1.5, label=f"{name} (spike)")
+        else:
+            counts, bins = np.histogram(s, bins=40, density=True)
+            centers = 0.5*(bins[1:] + bins[:-1])
+            ax.plot(centers, counts, linewidth=1.5, label=name)
+    ax.set_title("Turnover distribution (one-way, risk-matched)")
+    ax.grid(True); ax.legend()
+    fig.tight_layout(); fig.savefig(out_path, dpi=160)
+
+# 0) Turnover distribution (risk-matched scaled)
+plot_turnover_distribution(turn_series, os.path.join(OUT_DIR, "fig_turnover_density.png"))
+
+# 1) PC1 variance share (level, not log)
+pc1_share_level = np.exp(x_pc1)  # back from log
+plt.figure(figsize=(12,3.2))
+plt.plot(pc1_share_level.index, pc1_share_level.values)
+plt.title("PC1 Variance Share (rolling covariance)")
+plt.grid(True); plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR, "fig_pc1_share.png"), dpi=160)
+
+# 2) EW price w/ regime ribbon
+ew_price_curve = (1 + (R_aligned.mean(axis=1).fillna(0.0))).cumprod()
+fig, ax = plt.subplots(figsize=(12,4))
+ax.plot(ew_price_curve.index, ew_price_curve.values, linewidth=1.2)
+ax.set_title("EW Price with Regime Ribbon (PCA-HMM, Hard)")
+ax.grid(True)
+reg_series = labels.reindex(ew_price_curve.index).fillna(method='ffill')
+last = None
+for i, dt in enumerate(ew_price_curve.index):
+    r = int(reg_series.iloc[i]) if not pd.isna(reg_series.iloc[i]) else None
+    if i==0:
+        last = (dt, r)
+    elif r != last[1]:
+        ax.axvspan(last[0], ew_price_curve.index[i-1], alpha=0.10)
+        last = (dt, r)
+ax.axvspan(last[0], ew_price_curve.index[-1], alpha=0.10)
+fig.tight_layout()
+fig.savefig(os.path.join(OUT_DIR, "fig_regimes_ribbon.png"), dpi=160)
+
+# 3) Transition matrix heatmap (last fit)
+if len(trans_mats):
+    last_A = list(trans_mats.values())[-1]
+    plt.figure(figsize=(4,3))
+    plt.imshow(last_A, aspect='auto')
+    plt.colorbar()
+    plt.title("Transition Matrix (last fit)")
+    plt.xticks(range(K), [f"{i}" for i in range(K)])
+    plt.yticks(range(K), [f"{i}" for i in range(K)])
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUT_DIR, "fig_transmat_heat.png"), dpi=160)
+
+# 4) Regime MV weights (bar) — display (last window)
+plt.figure(figsize=(10,3.2))
+disp_reg_w = {}
+Lw = labels.iloc[-ROLL_FIT_N:]
+Rw = R_aligned.iloc[-ROLL_FIT_N:]
+for k in range(K):
+    idx_k = Lw.index[Lw==k]
+    if len(idx_k) < max(60, N*5):
+        disp_reg_w[k] = np.ones(N)/N
+    else:
+        mu = Rw.loc[idx_k].mean().values
+        Sigma = Rw.loc[idx_k].cov().values
+        disp_reg_w[k] = mean_var_weights(mu, Sigma, ridge=RIDGE, clip=CLIP)
+bar_data = np.array([disp_reg_w.get(k, np.ones(N)/N) for k in range(K)])
+xpos = np.arange(N); width = 0.8 / K
+for k in range(K):
+    plt.bar(xpos + k*width, bar_data[k], width=width, label=f"Regime {k}")
+plt.xticks(xpos + width*(K-1)/2, R_aligned.columns, rotation=0)
+plt.title("Mean–Variance Weights by Regime (display, last window)")
+plt.legend(ncol=min(3,K)); plt.grid(True, axis='y'); plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR, "fig_regime_weights_bar.png"), dpi=160)
+
+# 5) PC1 loadings (last window)
+if loadings_last is not None:
+    plt.figure(figsize=(10,3.2))
+    vals = np.abs(loadings_last)
+    xpos = np.arange(len(cols_last))
+    plt.bar(xpos, vals)
+    plt.xticks(xpos, cols_last, rotation=0)
+    plt.title("PC1 Loadings (last rolling window)")
+    plt.grid(True, axis='y')
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUT_DIR, "fig_pca_loadings_last.png"), dpi=160)
+
+# 6) Log cumulative wealth (risk-matched, pre-cost)
+plt.figure(figsize=(10,4))
+for name, rets in matched_series.items():
+    curve = (1+rets).cumprod()
+    plt.plot(curve.index, np.log(curve), label=name)
+plt.title("Log Cumulative Wealth (risk-matched, pre-cost)")
+plt.legend(); plt.grid(True); plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR, "fig_cum_wealth_matched.png"), dpi=160)
+
+# 7) Drawdowns (risk-matched, pre-cost)
+def ddplot_from_rets(name, rets):
+    curve, dd = smooth_drawdown_from_returns(rets)
+    plt.figure(figsize=(10,3))
+    plt.plot(dd.index, dd.values)
+    plt.title(f"Drawdown (risk-matched): {name}")
+    plt.grid(True); plt.tight_layout()
+    f = f"fig_drawdown_matched_{name.replace(' ','_').replace('-','').lower()}.png"
+    plt.savefig(os.path.join(OUT_DIR, f), dpi=160)
+
+for name, rets in matched_series.items():
+    ddplot_from_rets(name, rets)
+
+print(f"\nAll outputs saved in: {os.path.abspath(OUT_DIR)}")
+
+#!/usr/bin/env python3
+# Model 2 — Hybrid: Prob-HMM defensive core + Momentum sleeve (FAIR VERSION)
+# -------------------------------------------------------------------------
+# Your requests:
+# - Keep original (non-causal) regime weight estimation (full-sample by labels) ✅
+# Kept fixes:
+# - Constant-vol risk-parity baseline (IVP, rolling)
+# - Risk-matched (10% ann vol) headline table + net-of-costs grid (5/10/25/50 bps)
+# - Subperiod KPIs (2000–09 / 2010–19 / 2020–25)
+# - ES95 (daily) metric across tables; HMM calibration (Brier, ECE)
+# - Data manifest for reproducibility
+# - SAFE turnover distribution plot (histogram/spike fallback; no SciPy KDE) ✅
+# -------------------------------------------------------------------------
+
+import os, glob, warnings, numpy as np, pandas as pd, matplotlib.pyplot as plt
+from datetime import datetime
+warnings.filterwarnings("ignore")
+
+# ---------------- Config
+DATA_DIR="./data2"; OUT_DIR="./out2"
+K=3; ROLL_VOL_N=21; ROLL_FIT_N=500; REFIT_EVERY=3
+RIDGE=1e-6; CLIP=0.5; SEED=7
+MOMO_LB=126; MOMO_MIN_OBS=90; SOFTMAX_TAU=3.0; IVOL_WIN=21
+GAMMA_MAX=0.40
+
+# Fairness / reporting
+TARGET_VOL = 0.10            # risk-matched target vol (annualized)
+COST_BPS_GRID = [5,10,25,50]
+IVP_WIN   = 63               # inverse-vol lookback
+IVP_REBAL = 21               # rebalance every N days
+
+np.random.seed(SEED); os.makedirs(OUT_DIR, exist_ok=True)
+from hmmlearn.hmm import GaussianHMM
+
+# ---------------- IO / utils
+def load_data_from_dir(path):
+    files=sorted(glob.glob(os.path.join(path,"*.csv"))); frames=[]
+    for f in files:
+        tkr=os.path.splitext(os.path.basename(f))[0].upper()
+        df=pd.read_csv(f)
+        if "Date" not in df.columns and "date" in df.columns: df=df.rename(columns={"date":"Date"})
+        close_col=None
+        for c in ["Close","Adj Close","close","adj_close","AdjClose"]:
+            if c in df.columns: close_col=c; break
+        if close_col is None: continue
+        frames.append(df[["Date",close_col]].rename(columns={"Date":"Date", close_col:tkr}))
+    if not frames: raise FileNotFoundError("No usable CSVs.")
+    out=frames[0]
+    for df in frames[1:]: out=out.merge(df,on="Date",how="outer")
+    out["Date"]=pd.to_datetime(out["Date"]); out=out.sort_values("Date").set_index("Date").ffill().dropna(how="all")
+    return out
+
+def to_log_returns(P): return np.log(P/P.shift(1))
+
+def ew_vol_feature(R, n=21):
+    ew=R.mean(axis=1); vol=ew.rolling(n).std()
+    return np.log(vol + 1e-12).rename("x_ewvol")
+
+def mean_var_weights(mu, Sigma, ridge=1e-6, clip=0.5):
+    S=Sigma + ridge*np.eye(len(mu))
+    w=np.linalg.pinv(S) @ mu.reshape(-1,1); w=w.ravel()
+    w = w/np.abs(w).sum() if np.abs(w).sum()>0 else np.ones_like(w)/len(w)
+    w = np.clip(w, -clip, clip); w = w/np.abs(w).sum() if np.abs(w).sum()>0 else np.ones_like(w)/len(w)
+    return w
+
+def ann_kpis_from_returns(rets, freq=252):
+    rets=rets.dropna()
+    if rets.empty: return dict(ret=np.nan, vol=np.nan, sharpe=np.nan, maxdd=np.nan, es95=np.nan)
+    curve=(1+rets).cumprod()
+    maxdd=(curve/curve.cummax()-1).min()
+    ann_ret=(1+rets).prod()**(freq/len(rets)) - 1
+    ann_vol=rets.std()*np.sqrt(freq)
+    sharpe=ann_ret/ann_vol if ann_vol>0 else np.nan
+    q=np.quantile(rets, 0.05)
+    es95 = -rets[rets<=q].mean() if (rets<=q).any() else np.nan
+    return dict(ret=ann_ret, vol=ann_vol, sharpe=sharpe, maxdd=maxdd, es95=es95)
+
+def smooth_drawdown_from_returns(rets):
+    curve=(1+rets.fillna(0)).cumprod()
+    dd=curve/curve.cummax()-1.0
+    return curve, dd
+
+def softmax(x, tau=1.0):
+    x=np.asarray(x,dtype=float); x=x-np.nanmax(x); ex=np.exp(x/max(1e-12,tau))
+    ex[np.isnan(ex)]=0.0; s=ex.sum(); return ex/s if s>0 else np.zeros_like(ex)
+
+def inverse_vol_weights(R_window: pd.DataFrame):
+    vol = R_window.std().replace(0, np.nan)
+    w = 1.0/vol
+    w = w.replace([np.inf,-np.inf], np.nan).fillna(0.0)
+    if w.sum()>0: w = w/w.sum()
+    else: w = pd.Series(np.ones(len(R_window.columns))/len(R_window.columns), index=R_window.columns)
+    return w.values
+
+def turnover_series(W: pd.DataFrame):
+    Wf=W.fillna(method="ffill").fillna(0.0)
+    dW=(Wf - Wf.shift(1)).abs().sum(axis=1)*0.5
+    dW.iloc[0]=0.0
+    return dW
+
+def apply_costs(gross: pd.Series, turnover: pd.Series, cost_bps: float):
+    c=cost_bps/10000.0
+    return gross - c*turnover
+
+def risk_match(rets: pd.Series, target_vol=0.10, freq=252):
+    vol = rets.std()*np.sqrt(freq)
+    if not np.isfinite(vol) or vol<=0: return rets.copy(), 1.0
+    alpha = target_vol/vol
+    return rets*alpha, alpha
+
+# ORIGINAL (non-causal) per-regime MV weights from full-sample labels
+def regime_weights_from_labels(R, labels, ridge=1e-6, clip=0.5):
+    out={}; N=R.shape[1]
+    for k in sorted(labels.dropna().unique()):
+        idx=labels.index[labels==k]
+        if len(idx)<max(60,N*5): out[int(k)]=np.ones(N)/N
+        else:
+            sub=R.loc[idx]; mu=sub.mean().values; Sigma=sub.cov().values
+            out[int(k)] = mean_var_weights(mu,Sigma,ridge,clip)
+    return out
+
+# ---------------- Data & feature
+prices=load_data_from_dir(DATA_DIR)
+R=to_log_returns(prices).dropna()
+N=R.shape[1]; tickers=list(R.columns)
+
+# Manifest (repro)
+manifest = pd.DataFrame({
+    "Ticker": R.columns,
+    "FirstDate": [R.index.min()]*N,
+    "LastDate":  [R.index.max()]*N,
+    "Obs": [R[c].dropna().shape[0] for c in R.columns]
+})
+os.makedirs(OUT_DIR, exist_ok=True)
+manifest.to_csv(os.path.join(OUT_DIR,"m2_manifest.csv"), index=False)
+
+x=ew_vol_feature(R, ROLL_VOL_N).dropna()
+x_df=x.to_frame(); R_aligned=R.loc[x_df.index]; dates=x_df.index
+print(f"Loaded {N} assets, {len(dates)} obs.")
+
+# ---------------- Prob-HMM core (filtered & one-step-ahead)
+labels=pd.Series(index=dates, dtype=int)
+filt_prob=pd.DataFrame(index=dates, columns=[f"p{k}" for k in range(K)], dtype=float)
+ahead_prob=filt_prob.copy()
+model=None; last_fit=None
+
+for i, dt in enumerate(dates):
+    refit=(last_fit is None) or ((i-last_fit)>=REFIT_EVERY)
+    if refit:
+        s=max(0,i-ROLL_FIT_N); X=x_df.iloc[s:i+1].values
+        if len(X)<max(120, ROLL_FIT_N//4): continue
+        model=GaussianHMM(n_components=K, covariance_type='diag', n_iter=200, random_state=SEED); model.fit(X); last_fit=i
+    s=max(0,i-ROLL_FIT_N); X=x_df.iloc[s:i+1].values
+    path=model.predict(X); post=model.predict_proba(X)
+    labels.iloc[i]=path[-1]; alpha=post[-1]; filt_prob.iloc[i]=alpha; ahead_prob.iloc[i]=alpha @ model.transmat_
+
+# ---------------- Remap calm→mid→stress (by feature mean)
+means=[(k, x_df.loc[labels==k,"x_ewvol"].mean()) for k in range(K)]
+order=[k for (k,_) in sorted(means, key=lambda z:z[1])]
+remap={old:new for new,old in enumerate(order)}
+labels=labels.map(remap)
+filt_prob=filt_prob.rename(columns={f"p{old}":f"p{remap[old]}" for old in range(K)})
+ahead_prob=ahead_prob.rename(columns={f"p{old}":f"p{remap[old]}" for old in range(K)})
+
+# ---------------- Defensive core weights (NON-CAUSAL, original)
+regime_w = regime_weights_from_labels(R_aligned, labels, RIDGE, CLIP)
+
+W_core=pd.DataFrame(index=R_aligned.index, columns=R_aligned.columns, dtype=float)
+for dt in W_core.index:
+    p=ahead_prob.loc[dt]
+    if p.isna().any(): W_core.loc[dt]=np.ones(N)/N; continue
+    w=np.zeros(N)
+    for k in range(K): w += float(p[f"p{k}"])*regime_w.get(k, np.ones(N)/N)
+    w=np.clip(w, -CLIP, CLIP); ssum=np.abs(w).sum(); W_core.loc[dt]= w/(ssum if ssum>0 else 1.0)
+
+# ---------------- Momentum sleeve (unchanged logic)
+rets=R_aligned.copy(); price_proxy=(1+rets).cumprod()
+roll_vol=rets.rolling(IVOL_WIN).std()
+roll_ret=price_proxy/price_proxy.shift(MOMO_LB) - 1.0
+
+momo_score=(roll_ret/(roll_vol+1e-12)).replace([np.inf,-np.inf], np.nan).fillna(0.0)
+momo_score=momo_score.sub(momo_score.mean(axis=1), axis=0)
+momo_score=momo_score.div(momo_score.std(axis=1)+1e-12, axis=0)
+
+inv_vol=1.0/(roll_vol+1e-12); inv_vol=inv_vol.div(inv_vol.sum(axis=1), axis=0).fillna(0.0)
+
+W_sleeve=pd.DataFrame(index=rets.index, columns=rets.columns, dtype=float)
+for dt in rets.index:
+    srow=momo_score.loc[dt] if dt in momo_score.index else None
+    vrow=inv_vol.loc[dt] if dt in inv_vol.index else None
+    if srow is None or vrow is None or srow.isna().all() or vrow.isna().all():
+        W_sleeve.loc[dt]=np.ones(N)/N; continue
+    w_raw=softmax(srow.values, tau=SOFTMAX_TAU)
+    w=w_raw * vrow.values
+    w=w/np.abs(w).sum() if np.abs(w).sum()>0 else np.ones(N)/N
+    W_sleeve.loc[dt]=w
+
+W_sleeve=W_sleeve.loc[W_core.index].fillna(method="ffill")
+
+# ---------------- Regime-aware blend
+p_stress=ahead_prob[f"p{K-1}"].reindex(W_core.index).fillna(method="ffill").clip(0,1)
+gamma_t=GAMMA_MAX*(1 - p_stress)
+
+W_final=pd.DataFrame(index=W_core.index, columns=W_core.columns, dtype=float)
+for dt in W_core.index:
+    g=float(gamma_t.loc[dt]) if dt in gamma_t.index else 0.0
+    w=(1-g)*W_core.loc[dt].values + g*W_sleeve.loc[dt].values
+    w=np.clip(w, -CLIP, CLIP); ssum=np.abs(w).sum(); W_final.loc[dt]= w/(ssum if ssum>0 else 1.0)
+
+# ---------------- Daily returns & turnover
+ret_core  =(R_aligned * W_core.shift(1)).sum(axis=1).fillna(0.0)
+ret_sleeve=(R_aligned * W_sleeve.shift(1)).sum(axis=1).fillna(0.0)
+ret_final =(R_aligned * W_final.shift(1)).sum(axis=1).fillna(0.0)
+
+turn_core   = turnover_series(W_core)
+turn_sleeve = turnover_series(W_sleeve)
+turn_final  = turnover_series(W_final)
+
+# ---------------- Baselines
+# Static MV
+Sigma=R_aligned.cov().values; mu=R_aligned.mean().values
+w_sta=mean_var_weights(mu, Sigma, ridge=RIDGE, clip=CLIP)
+W_sta = pd.DataFrame([w_sta]*len(R_aligned), index=R_aligned.index, columns=R_aligned.columns)
+ret_sta=(R_aligned @ pd.Series(w_sta, index=R_aligned.columns)).fillna(0.0)
+turn_sta = turnover_series(W_sta)
+
+# Equal-Weight
+w_ew=np.ones(N)/N
+W_ew = pd.DataFrame([w_ew]*len(R_aligned), index=R_aligned.index, columns=R_aligned.columns)
+ret_ew=(R_aligned @ pd.Series(w_ew, index=R_aligned.columns)).fillna(0.0)
+turn_ew = turnover_series(W_ew)
+
+# Constant-Vol Risk-Parity (IVP), rolling
+W_ivp = pd.DataFrame(index=R_aligned.index, columns=R_aligned.columns, dtype=float)
+for i, dt in enumerate(R_aligned.index):
+    if i<IVP_WIN:
+        W_ivp.iloc[i]=np.ones(N)/N
+    else:
+        if i % IVP_REBAL == 0 or i == IVP_WIN:
+            Rw=R_aligned.iloc[i-IVP_WIN:i]
+            W_ivp.iloc[i]=inverse_vol_weights(Rw)
+        else:
+            W_ivp.iloc[i]=W_ivp.iloc[i-1]
+W_ivp=W_ivp.fillna(method="ffill").fillna(1.0/N)
+ret_ivp=(R_aligned * W_ivp.shift(1)).sum(axis=1).fillna(0.0)
+turn_ivp = turnover_series(W_ivp)
+
+# ---------------- KPIs (native, pre-cost)
+def krow(name, rets):
+    k=ann_kpis_from_returns(rets)
+    return [name, k['ret'], k['vol'], k['sharpe'], k['maxdd'], k['es95']]
+
+kpi_native = pd.DataFrame(
+    [krow("Equal-Weight", ret_ew),
+     krow("Static MV", ret_sta),
+     krow("IVP (Const-Vol RP, rolling)", ret_ivp),
+     krow("HMM Core (prob)", ret_core),
+     krow("Momentum Sleeve", ret_sleeve),
+     krow("Hybrid Ensemble", ret_final)],
+    columns=["Strategy","Ann.Return","Ann.Vol","Sharpe","MaxDD","ES95_day"]
+)
+kpi_native.to_csv(os.path.join(OUT_DIR,"m2_kpi_native.csv"), index=False)
+print("\n=== Model 2 KPIs (native, pre-cost) ===")
+print(kpi_native.to_string(index=False, float_format=lambda x: f"{x:,.4f}"))
+
+# ---------------- Risk-matched table (10% vol)
+def matched_series_and_alpha(name, rets, turn):
+    rm, alpha = risk_match(rets, TARGET_VOL)
+    return name, rm, turn*alpha, alpha, ann_kpis_from_returns(rm)
+
+matched = {}
+turn_m  = {}
+alphas  = {}
+rows=[]
+for name, rets, turn in [
+    ("Equal-Weight", ret_ew, turn_ew),
+    ("Static MV", ret_sta, turn_sta),
+    ("IVP (Const-Vol RP, rolling)", ret_ivp, turn_ivp),
+    ("HMM Core (prob)", ret_core, turn_core),
+    ("Momentum Sleeve", ret_sleeve, turn_sleeve),
+    ("Hybrid Ensemble", ret_final, turn_final),
+]:
+    nm, rm, tm, a, k = matched_series_and_alpha(name, rets, turn)
+    matched[nm]=rm; turn_m[nm]=tm; alphas[nm]=a
+    rows.append([nm, k['ret'], k['vol'], k['sharpe'], k['maxdd'], k['es95'], a])
+
+kpi_matched = pd.DataFrame(rows, columns=["Strategy","Ann.Return","Ann.Vol","Sharpe","MaxDD","ES95_day","Alpha(scale)"])
+kpi_matched.to_csv(os.path.join(OUT_DIR,"m2_kpi_matchedVol.csv"), index=False)
+print("\n=== Model 2 KPIs (risk-matched @ {:.0f}%) ===".format(TARGET_VOL*100))
+print(kpi_matched.to_string(index=False, float_format=lambda x: f"{x:,.4f}"))
+
+# ---------------- Net-of-costs grid on risk-matched
+def cost_grid(cost_list):
+    out=[]
+    for c in cost_list:
+        for nm in matched:
+            net = apply_costs(matched[nm], turn_m[nm], c)
+            k = ann_kpis_from_returns(net)
+            out.append([c, nm, k['ret'], k['vol'], k['sharpe'], k['maxdd'], k['es95']])
+    return pd.DataFrame(out, columns=["Cost_bps","Strategy","Ann.Return","Ann.Vol","Sharpe","MaxDD","ES95_day"])
+
+kpi_costs = cost_grid(COST_BPS_GRID)
+kpi_costs.to_csv(os.path.join(OUT_DIR,"m2_kpi_matchedVol_costGrid.csv"), index=False)
+print("\nSaved net-of-costs grid → ./out/m2_kpi_matchedVol_costGrid.csv")
+
+# ---------------- Turnover stats
+turn_stats=[]
+for nm, ts in turn_m.items():
+    turn_stats.append([nm, ts.mean(), ts.median(), ts.quantile(0.9), ts.max()])
+turn_df = pd.DataFrame(turn_stats, columns=["Strategy","Turnover_mean","Turnover_median","Turnover_p90","Turnover_max"])
+turn_df.to_csv(os.path.join(OUT_DIR,"m2_turnover_stats.csv"), index=False)
+
+# ---------------- Subperiod panels (risk-matched)
+def subperiod_slices(idx):
+    eras=[("2000-01-01","2009-12-31"), ("2010-01-01","2019-12-31"), ("2020-01-01", str(idx.max().date()))]
+    out=[]
+    for s,e in eras:
+        sdt=pd.Timestamp(s); edt=pd.Timestamp(e)
+        mask=(idx>=sdt)&(idx<=edt)
+        if mask.any(): out.append((s,e,mask))
+    return out
+
+subs=[]
+for (s,e,mask) in subperiod_slices(R_aligned.index):
+    for nm in matched:
+        k=ann_kpis_from_returns(matched[nm].loc[mask])
+        subs.append([f"{s}–{e}", nm, k['ret'], k['vol'], k['sharpe'], k['maxdd'], k['es95']])
+sub_df=pd.DataFrame(subs, columns=["Period","Strategy","Ann.Return","Ann.Vol","Sharpe","MaxDD","ES95_day"])
+sub_df.to_csv(os.path.join(OUT_DIR,"m2_kpi_matchedVol_subperiods.csv"), index=False)
+
+# ---------------- HMM calibration (one-step-ahead)
+# Compare ahead_prob(t) with realized label at t+1 (shift by 1)
+probs = ahead_prob.copy().dropna()
+y_true = labels.reindex(probs.index).shift(-1).dropna()
+probs = probs.loc[y_true.index]
+
+# Multiclass Brier
+Y = np.zeros((len(y_true), K))
+for i, y in enumerate(y_true.values.astype(int)):
+    if 0 <= y < K: Y[i, y]=1.0
+P = probs[[f"p{k}" for k in range(K)]].values
+brier = np.mean(np.sum((P - Y)**2, axis=1))
+
+# ECE (top-class, 10 bins)
+conf = P.max(axis=1); pred = P.argmax(axis=1); acc = (pred==y_true.values.astype(int)).astype(float)
+bins = np.linspace(0,1,11); ece=0.0
+for b0, b1 in zip(bins[:-1], bins[1:]):
+    idx = (conf>=b0) & (conf<b1)
+    if idx.any():
+        ece += np.mean(idx) * abs(acc[idx].mean() - conf[idx].mean())
+cal_df = pd.DataFrame({"Metric":["Brier","ECE_top10"], "Value":[brier, ece]})
+cal_df.to_csv(os.path.join(OUT_DIR,"m2_hmm_calibration.csv"), index=False)
+
+# ---------------- SAFE turnover distribution (no SciPy KDE)
+def plot_turnover_distribution(turn_map, out_path):
+    fig, ax = plt.subplots(figsize=(10,4))
+    for name, ts in turn_map.items():
+        s = pd.Series(ts).replace([np.inf, -np.inf], np.nan).dropna()
+        s = s[np.isfinite(s)]
+        if (len(s) == 0) or (s.std() <= 1e-12) or (s.nunique() < 3):
+            val = float(s.iloc[0]) if len(s) else 0.0
+            ax.axvline(val, linestyle="--", linewidth=1.5, label=f"{name} (spike)")
+        else:
+            counts, bins = np.histogram(s, bins=40, density=True)
+            centers = 0.5*(bins[1:] + bins[:-1])
+            ax.plot(centers, counts, linewidth=1.5, label=name)
+    ax.set_title("Turnover distribution (one-way, risk-matched)")
+    ax.grid(True); ax.legend()
+    fig.tight_layout(); fig.savefig(out_path, dpi=180)
+
+plot_turnover_distribution(turn_m, os.path.join(OUT_DIR,"m2_fig_turnover_density.png"))
+
+# ---------------- Figures (standardized, comparable)
+# Risk-matched log cumulative wealth (pre-cost)
+plt.figure(figsize=(10,4))
+for nm, sr in matched.items():
+    curve=(1+sr).cumprod()
+    plt.plot(curve.index, np.log(curve), label=nm)
+plt.title("Log Cumulative Wealth — Risk-matched (10% vol)"); plt.legend(); plt.grid(True, alpha=.3); plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR,"m2_fig_cum_wealth_matched.png"), dpi=180)
+
+# Risk-matched drawdowns
+def ddplot_from_rets(name, rets):
+    curve, dd = smooth_drawdown_from_returns(rets)
+    plt.figure(figsize=(10,3)); plt.plot(dd)
+    plt.title(f"Drawdown (risk-matched) — {name}"); plt.grid(True, alpha=.3); plt.tight_layout()
+    plt.savefig(os.path.join(OUT_DIR, f"m2_fig_drawdown_matched_{name.replace(' ','_').replace('-','')}.png"), dpi=180)
+
+for nm, sr in matched.items():
+    ddplot_from_rets(nm, sr)
+
+# Native wealth (pre-cost)
+curve_core  =(1+ret_core).cumprod()
+curve_sleeve=(1+ret_sleeve).cumprod()
+curve_final =(1+ret_final).cumprod()
+curve_sta   =(1+ret_sta).cumprod()
+curve_ew    =(1+ret_ew).cumprod()
+
+plt.figure(figsize=(10,4))
+plt.plot(np.log(curve_final),  label="Hybrid Ensemble")
+plt.plot(np.log(curve_core),   label="HMM Core (prob)")
+plt.plot(np.log(curve_sleeve), label="Momentum Sleeve")
+plt.plot(np.log(curve_sta),    label="Static MV")
+plt.plot(np.log(curve_ew),     label="Equal-Weight")
+plt.title("Log Cumulative Wealth — Model 2 (native)"); plt.legend(); plt.grid(True, alpha=.3); plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR,"m2_cum_wealth_native.png"), dpi=180)
+
+# Prob ribbon
+cols=[f"p{k}" for k in range(K)]
+pdf=ahead_prob[cols].dropna(how="any")
+plt.figure(figsize=(12,3.6))
+plt.stackplot(pdf.index, pdf.values.T, labels=cols, alpha=0.9)
+plt.ylim(0,1); plt.title("One-step-ahead Probabilities — Model 2"); plt.legend(ncol=K, fontsize=8, frameon=False)
+plt.grid(True, alpha=.2); plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR,"m2_prob_ribbon.png"), dpi=180)
+
+# Weights timelines
+plt.figure(figsize=(11,4))
+plt.stackplot(W_core.index, W_core.fillna(method="ffill").values.T, labels=tickers)
+plt.title("Portfolio Weights — HMM Core (prob)"); plt.legend(loc="upper left", ncol=min(N,4), fontsize=8)
+plt.tight_layout(); plt.savefig(os.path.join(OUT_DIR,"m2_weights_core.png"), dpi=180)
+
+plt.figure(figsize=(11,4))
+plt.stackplot(W_sleeve.index, W_sleeve.fillna(method="ffill").values.T, labels=tickers)
+plt.title("Portfolio Weights — Momentum Sleeve"); plt.legend(loc="upper left", ncol=min(N,4), fontsize=8)
+plt.tight_layout(); plt.savefig(os.path.join(OUT_DIR,"m2_weights_sleeve.png"), dpi=180)
+
+plt.figure(figsize=(11,4))
+plt.stackplot(W_final.index, W_final.fillna(method="ffill").values.T, labels=tickers)
+plt.title("Portfolio Weights — Hybrid Ensemble"); plt.legend(loc="upper left", ncol=min(N,4), fontsize=8)
+plt.tight_layout(); plt.savefig(os.path.join(OUT_DIR,"m2_weights_final.png"), dpi=180)
+
+# Sleeve intensity
+plt.figure(figsize=(10,3))
+plt.plot(gamma_t.index, gamma_t.values)
+plt.title(r"Sleeve Intensity $\gamma_t$ = GAMMA_MAX · (1 − P_{stress})"); plt.grid(True, alpha=.3); plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR,"m2_sleeve_intensity.png"), dpi=180)
+
+# Momentum heatmap (z-scores)
+momo_sub=momo_score.loc[W_core.index].copy(); Z=momo_sub.values.T
+fig, ax = plt.subplots(figsize=(12, 3 + 0.12*N))
+im=ax.imshow(Z, aspect="auto", cmap="viridis", vmin=-2.5, vmax=2.5)
+ax.set_yticks(range(N)); ax.set_yticklabels(tickers)
+xt=np.linspace(0, Z.shape[1]-1, 8, dtype=int)
+ax.set_xticks(xt); ax.set_xticklabels([momo_sub.index[i].strftime("%Y") for i in xt])
+fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02).set_label("Momentum z-score")
+ax.set_title("Momentum Heatmap — Model 2"); fig.tight_layout()
+fig.savefig(os.path.join(OUT_DIR,"m2_momo_heatmap.png"), dpi=180)
+
+print(f"\nFigures & tables saved in: {os.path.abspath(OUT_DIR)}")
+
+#!/usr/bin/env python3
+# Model 3 — RA-HRP: Prob-HMM on features + per-regime HRP allocation (FAIR VERSION)
+# -------------------------------------------------------------------------
+# Kept core:
+# - Per-regime HRP weights blended by one-step-ahead HMM probs (your original)
+# Additions:
+# - HRP on mixture covariance Σ̄_t = Σ_s p_s(t) (exact alternative to prob-blend)
+# - Constant-vol Risk-Parity (IVP) baseline (rolling)
+# - Risk-matched (10% ann vol) headline table + net-of-costs grid (5/10/25/50 bps)
+# - Subperiod KPIs (2000–09 / 2010–19 / 2020–*)
+# - ES95 (daily) metric, turnover stats, safe turnover plot (no SciPy KDE)
+# - HMM calibration (Brier, ECE) and data manifest
+# FIXES:
+# - "Static HRP" now FAIR (expanding window + monthly rebalance + shrinkage; no look-ahead)
+# - Portfolio returns computed as simple returns from weighted log-returns
+# -------------------------------------------------------------------------
+
+import os, glob, warnings, numpy as np, pandas as pd, matplotlib.pyplot as plt
+warnings.filterwarnings("ignore")
+
+# ---------- Config
+DATA_DIR="./data2"; OUT_DIR="./out3"
+K=3; ROLL_VOL_N=21; ROLL_FIT_N=500; REFIT_EVERY=3
+CLIP=0.5; SEED=7
+TARGET_VOL = 0.10                 # risk-matched target annual vol
+COST_BPS_GRID = [5,10,25,50]      # bps per one-way turnover
+IVP_WIN=63; IVP_REBAL=21          # IVP baseline params
+LABEL_HRP = "Static HRP"          # keep legacy name for comparability
+
+np.random.seed(SEED); os.makedirs(OUT_DIR, exist_ok=True)
+
+from hmmlearn.hmm import GaussianHMM
+
+# --- Shrinkage (optional, with fallback) ---
+try:
+    from sklearn.covariance import LedoitWolf
+except Exception:
+    LedoitWolf = None
+
+# ---------- IO / core utils
+def load_data_from_dir(path):
+    files=sorted(glob.glob(os.path.join(path,"*.csv"))); frames=[]
+    for f in files:
+        tkr=os.path.splitext(os.path.basename(f))[0].upper()
+        df=pd.read_csv(f)
+        if "Date" not in df.columns and "date" in df.columns: df=df.rename(columns={"date":"Date"})
+        for c in ["Close","Adj Close","close","adj_close","AdjClose"]:
+            if c in df.columns:
+                frames.append(df[["Date",c]].rename(columns={"Date":"Date", c:tkr})); break
+    if not frames: raise FileNotFoundError("No usable CSVs.")
+    out=frames[0]
+    for df in frames[1:]: out=out.merge(df,on="Date",how="outer")
+    out["Date"]=pd.to_datetime(out["Date"]); out=out.sort_values("Date").set_index("Date").ffill().dropna(how="all")
+    return out
+
+def to_log_returns(P): return np.log(P/P.shift(1))
+
+def ew_vol_feature(R, n=21):
+    ew=R.mean(axis=1); vol=ew.rolling(n).std()
+    return np.log(vol + 1e-12).rename("x_ewvol")
+
+def pca_pc1_var_feature(R, win=63):
+    from numpy.linalg import eigh
+    vals, idxs = [], []
+    for i in range(win-1, len(R)):
+        X = R.iloc[i-win+1:i+1].dropna(how="any")
+        if len(X)<win: continue
+        C = X.cov().values
+        evals,_ = eigh(C); lam1=float(evals[-1]); total=float(evals.sum())+1e-12
+        vals.append(np.log(lam1/total + 1e-12)); idxs.append(R.index[i])
+    return pd.Series(vals, index=idxs, name="x_pc1")
+
+def ann_kpis_from_returns(rets, freq=252):
+    rets = pd.Series(rets).dropna()
+    if rets.empty: return dict(ret=np.nan, vol=np.nan, sharpe=np.nan, maxdd=np.nan, es95=np.nan)
+    curve=(1+rets).cumprod()
+    maxdd=(curve/curve.cummax()-1).min()
+    ann_ret=(1+rets).prod()**(freq/len(rets)) - 1
+    ann_vol=rets.std()*np.sqrt(freq)
+    sharpe=ann_ret/ann_vol if ann_vol>0 else np.nan
+    q=np.quantile(rets, 0.05)
+    es95 = -rets[rets<=q].mean() if (rets<=q).any() else np.nan
+    return dict(ret=ann_ret, vol=ann_vol, sharpe=sharpe, maxdd=maxdd, es95=es95)
+
+def smooth_drawdown_from_returns(rets):
+    curve=(1+pd.Series(rets).fillna(0)).cumprod()
+    dd=curve/curve.cummax()-1.0
+    return curve, dd
+
+# ---------- HRP helpers
+def inverse_variance_portfolio(Sigma):
+    d=np.diag(Sigma).clip(1e-12,None); iv=1.0/d; w=iv/iv.sum(); return w
+
+def _corr_from_cov(Sigma):
+    std=np.sqrt(np.diag(Sigma)).clip(1e-12,None)
+    return Sigma/np.outer(std,std)
+
+def _seriation_greedy(Corr):
+    N=Corr.shape[0]; remaining=list(range(N))
+    start=int(np.argmax(Corr.mean(axis=1))); order=[start]; remaining.remove(start)
+    while remaining:
+        last=order[-1]; nxt=max(remaining, key=lambda j: Corr[last,j])
+        order.append(nxt); remaining.remove(nxt)
+    return order
+
+def hrp_weights(Sigma):
+    Corr=_corr_from_cov(Sigma); order=_seriation_greedy(Corr)
+    N=Sigma.shape[0]; w=np.ones(N); clusters=[order]
+    while clusters:
+        new=[]
+        for cl in clusters:
+            if len(cl)<=1: continue
+            m=len(cl)//2; c1, c2 = cl[:m], cl[m:]
+            S1=Sigma[np.ix_(c1,c1)]; S2=Sigma[np.ix_(c2,c2)]
+            w1=inverse_variance_portfolio(S1); v1=float(w1@S1@S1@w1) if False else float(w1@S1@w1)
+            w2=inverse_variance_portfolio(S2); v2=float(w2@S2@S2@w2) if False else float(w2@S2@w2)
+            a = 1.0 - v1/(v1+v2) if (v1+v2)>0 else 0.5
+            w[c1]*=a; w[c2]*=(1.0-a)
+            if len(c1)>1: new.append(c1)
+            if len(c2)>1: new.append(c2)
+        clusters=new
+    w=np.clip(w,0,None); s=np.abs(w).sum(); return w/(s if s>0 else 1.0)
+
+def inverse_vol_weights(R_window: pd.DataFrame):
+    vol = R_window.std().replace(0, np.nan)
+    w = 1.0/vol
+    w = w.replace([np.inf,-np.inf], np.nan).fillna(0.0)
+    if w.sum()>0: w = w/w.sum()
+    else: w = pd.Series(np.ones(len(R_window.columns))/len(R_window.columns), index=R_window.columns)
+    return w.values
+
+def turnover_series(W: pd.DataFrame):
+    Wf=W.fillna(method="ffill").fillna(0.0)
+    dW=(Wf - Wf.shift(1)).abs().sum(axis=1)*0.5
+    dW.iloc[0]=0.0
+    return dW
+
+def apply_costs(gross: pd.Series, turnover: pd.Series, cost_bps: float):
+    c=cost_bps/10000.0
+    return gross - c*turnover
+
+def risk_match(rets: pd.Series, target_vol=0.10, freq=252):
+    vol = rets.std()*np.sqrt(freq)
+    if not np.isfinite(vol) or vol<=0: return rets.copy(), 1.0
+    alpha = target_vol/vol
+    return rets*alpha, alpha
+
+def shrink_cov_matrix(R_window: pd.DataFrame):
+    """
+    Robust covariance:
+      - Ledoit–Wolf shrinkage when available
+      - PSD projection (eigenvalue floor) as a safety
+    """
+    X = R_window.values
+    if LedoitWolf is not None and X.shape[0] > X.shape[1] + 2:
+        try:
+            S = LedoitWolf().fit(X).covariance_
+        except Exception:
+            S = R_window.cov().values
+    else:
+        S = R_window.cov().values
+    S = np.asarray(S, float)
+    S[~np.isfinite(S)] = 0.0
+    vals, vecs = np.linalg.eigh(S)
+    vals = np.clip(vals, 1e-8, None)
+    S_psd = (vecs * vals) @ vecs.T
+    return S_psd
+
+# ---------- Data & features (two-feature HMM like paper)
+prices=load_data_from_dir(DATA_DIR)
+R=to_log_returns(prices).dropna()
+N=R.shape[1]; tickers=list(R.columns)
+
+# Manifest (repro)
+manifest = pd.DataFrame({
+    "Ticker": R.columns,
+    "FirstDate": [R.index.min()]*N,
+    "LastDate":  [R.index.max()]*N,
+    "Obs": [R[c].dropna().shape[0] for c in R.columns]
+})
+manifest.to_csv(os.path.join(OUT_DIR, "m3_manifest.csv"), index=False)
+
+x1=ew_vol_feature(R, n=ROLL_VOL_N)
+x2=pca_pc1_var_feature(R, win=ROLL_VOL_N)
+x_df=pd.concat([x1,x2], axis=1).dropna()
+R_aligned=R.loc[x_df.index]; dates=x_df.index
+print(f"Loaded {N} assets, {len(dates)} obs, features={list(x_df.columns)}")
+
+# ---------- Prob-HMM on features
+labels=pd.Series(index=dates, dtype=int)
+filt_prob=pd.DataFrame(index=dates, columns=[f"p{k}" for k in range(K)], dtype=float)
+ahead_prob=filt_prob.copy()
+model=None; last_fit=None
+
+for i, dt in enumerate(dates):
+    refit=(last_fit is None) or ((i-last_fit)>=REFIT_EVERY)
+    if refit:
+        s=max(0,i-ROLL_FIT_N); X=x_df.iloc[s:i+1].values
+        if len(X)<max(120, ROLL_FIT_N//4): continue
+        model=GaussianHMM(n_components=K, covariance_type='diag', n_iter=200, random_state=SEED); model.fit(X); last_fit=i
+    s=max(0,i-ROLL_FIT_N); X=x_df.iloc[s:i+1].values
+    path=model.predict(X); post=model.predict_proba(X)
+    labels.iloc[i]=path[-1]; alpha=post[-1]; filt_prob.iloc[i]=alpha; ahead_prob.iloc[i]=alpha @ model.transmat_
+
+# ---------- Remap calm→mid→stress
+z1=(x_df["x_ewvol"]-x_df["x_ewvol"].mean())/(x_df["x_ewvol"].std()+1e-12)
+z2=(x_df["x_pc1"] -x_df["x_pc1"].mean()) /(x_df["x_pc1"].std() +1e-12)
+stress=z1+z2
+means=[(k, stress[labels==k].mean()) for k in range(K)]
+order=[k for (k,_) in sorted(means, key=lambda z:z[1])]
+remap={old:new for new,old in enumerate(order)}
+labels=labels.map(remap)
+filt_prob=filt_prob.rename(columns={f"p{old}":f"p{remap[old]}" for old in range(K)})
+ahead_prob=ahead_prob.rename(columns={f"p{old}":f"p{remap[old]}" for old in range(K)})
+
+# ---------- Per-regime HRP weights (NON-CAUSAL, original)
+def regime_hrp_weights(R, labels):
+    out={}
+    for k in sorted(labels.dropna().unique()):
+        idx=labels.index[labels==k]
+        if len(idx) < max(60, R.shape[1]*5):
+            out[int(k)] = np.ones(R.shape[1])/R.shape[1]; continue
+        Sigma = R.loc[idx].cov().values
+        try: w = hrp_weights(Sigma)
+        except Exception: w = inverse_variance_portfolio(Sigma)
+        w=np.clip(w, -CLIP, CLIP); s=np.abs(w).sum(); out[int(k)] = w/(s if s>0 else 1.0)
+    return out
+
+regime_w=regime_hrp_weights(R_aligned, labels)
+
+# ---------- Also precompute per-regime covariance matrices (for Σ̄)
+regime_Sigma={}
+for k in sorted(labels.dropna().unique()):
+    idx=labels.index[labels==k]
+    if len(idx) < max(60, R.shape[1]*5):
+        regime_Sigma[int(k)] = np.diag(R_aligned.var().values)
+    else:
+        regime_Sigma[int(k)] = R_aligned.loc[idx].cov().values
+
+# ---------- Returns helper: weighted log-returns → simple returns
+def port_simple_returns_from_log(R_log: pd.DataFrame, W: pd.DataFrame):
+    r_log = (R_log * W.shift(1)).sum(axis=1).fillna(0.0)
+    return np.expm1(r_log)
+
+# ---------- Portfolios
+# (A) Original RA-HRP: prob-blend of per-regime HRP weights
+W_prob=pd.DataFrame(index=R_aligned.index, columns=R_aligned.columns, dtype=float)
+for dt in W_prob.index:
+    p=ahead_prob.loc[dt]
+    if p.isna().any(): W_prob.loc[dt]=np.ones(N)/N; continue
+    w=np.zeros(N)
+    for k in range(K): w += float(p[f"p{k}"])*regime_w.get(k, np.ones(N)/N)
+    w=np.clip(w, -CLIP, CLIP); s=np.abs(w).sum(); W_prob.loc[dt]= w/(s if s>0 else 1.0)
+
+# (B) Mixture-covariance HRP: HRP on Σ̄_t = Σ_s p_s(t)
+W_mix=pd.DataFrame(index=R_aligned.index, columns=R_aligned.columns, dtype=float)
+for dt in W_mix.index:
+    p=ahead_prob.loc[dt]
+    if p.isna().any(): W_mix.loc[dt]=np.ones(N)/N; continue
+    Sbar=np.zeros((N,N))
+    for k in range(K):
+        Sbar += float(p[f"p{k}"]) * regime_Sigma.get(k, np.diag(R_aligned.var().values))
+    try: w = hrp_weights(Sbar)
+    except Exception: w = inverse_variance_portfolio(Sbar)
+    w=np.clip(w, -CLIP, CLIP); s=np.abs(w).sum(); W_mix.loc[dt]= w/(s if s>0 else 1.0)
+
+# Daily simple returns & turnover
+ret_prob = port_simple_returns_from_log(R_aligned, W_prob)
+ret_mix  = port_simple_returns_from_log(R_aligned, W_mix)
+turn_prob = turnover_series(W_prob)
+turn_mix  = turnover_series(W_mix)
+
+# ---------- Baselines
+# Equal-Weight (constant)
+w_ew=np.ones(N)/N
+W_ew=pd.DataFrame([w_ew]*len(R_aligned), index=R_aligned.index, columns=R_aligned.columns)
+ret_ew=port_simple_returns_from_log(R_aligned, W_ew)
+turn_ew=turnover_series(W_ew)
+
+# "Static HRP" (FAIR): expanding window, monthly rebalance, shrinkage (no look-ahead)
+HRP_MIN_WIN = max(252, ROLL_FIT_N)   # at least ~1y or your model fit length
+HRP_REBAL   = 21                     # ~monthly
+
+W_hrp = pd.DataFrame(index=R_aligned.index, columns=R_aligned.columns, dtype=float)
+last_w = np.ones(N)/N
+
+for i, dt in enumerate(R_aligned.index):
+    if i < HRP_MIN_WIN:
+        W_hrp.iloc[i] = last_w
+        continue
+    if (i == HRP_MIN_WIN) or (i % HRP_REBAL == 0):
+        Rw = R_aligned.iloc[:i]  # EXPANDING window up to t-1
+        Sigma_hat = shrink_cov_matrix(Rw)
+        try:
+            w = hrp_weights(Sigma_hat)
+        except Exception:
+            w = inverse_variance_portfolio(Sigma_hat)
+        w = np.clip(w, -CLIP, CLIP)
+        s = np.abs(w).sum()
+        last_w = w / (s if s > 0 else 1.0)
+    W_hrp.iloc[i] = last_w
+
+W_hrp = W_hrp.fillna(method="ffill").fillna(1.0/N)
+ret_hrp = port_simple_returns_from_log(R_aligned, W_hrp)
+turn_hrp = turnover_series(W_hrp)
+
+# Constant-Vol Risk-Parity (IVP), rolling
+W_ivp = pd.DataFrame(index=R_aligned.index, columns=R_aligned.columns, dtype=float)
+for i, dt in enumerate(R_aligned.index):
+    if i<IVP_WIN:
+        W_ivp.iloc[i]=np.ones(N)/N
+    else:
+        if i % IVP_REBAL == 0 or i == IVP_WIN:
+            Rw=R_aligned.iloc[i-IVP_WIN:i]
+            W_ivp.iloc[i]=inverse_vol_weights(Rw)
+        else:
+            W_ivp.iloc[i]=W_ivp.iloc[i-1]
+W_ivp=W_ivp.fillna(method="ffill").fillna(1.0/N)
+ret_ivp=port_simple_returns_from_log(R_aligned, W_ivp)
+turn_ivp=turnover_series(W_ivp)
+
+# ---------- KPIs (native, pre-cost)
+def krow(name, rets):
+    k=ann_kpis_from_returns(rets)
+    return [name, k['ret'], k['vol'], k['sharpe'], k['maxdd'], k['es95']]
+
+kpi_native = pd.DataFrame(
+    [krow("Equal-Weight", ret_ew),
+     krow(LABEL_HRP, ret_hrp),                         # keep label "Static HRP"
+     krow("IVP (Const-Vol RP, rolling)", ret_ivp),
+     krow("RA-HRP (prob-blend)", ret_prob),
+     krow("RA-HRP (mixture-cov HRP)", ret_mix)],
+    columns=["Strategy","Ann.Return","Ann.Vol","Sharpe","MaxDD","ES95_day"]
+)
+kpi_native.to_csv(os.path.join(OUT_DIR,"m3_kpi_native.csv"), index=False)
+print("\n=== Model 3 KPIs (native, pre-cost) ===")
+print(kpi_native.to_string(index=False, float_format=lambda x: f"{x:,.4f}"))
+
+# ---------- Risk-matched table (10% vol)
+def matched_series_and_alpha(name, rets, turn):
+    rm, alpha = risk_match(rets, TARGET_VOL)
+    return name, rm, turn*alpha, alpha, ann_kpis_from_returns(rm)
+
+matched = {}
+turn_m  = {}
+alphas  = {}
+rows=[]
+for name, rets, turn in [
+    ("Equal-Weight", ret_ew, turn_ew),
+    (LABEL_HRP, ret_hrp, turn_hrp),                   # keep label "Static HRP"
+    ("IVP (Const-Vol RP, rolling)", ret_ivp, turn_ivp),
+    ("RA-HRP (prob-blend)", ret_prob, turn_prob),
+    ("RA-HRP (mixture-cov HRP)", ret_mix, turn_mix),
+]:
+    nm, rm, tm, a, k = matched_series_and_alpha(name, rets, turn)
+    matched[nm]=rm; turn_m[nm]=tm; alphas[nm]=a
+    rows.append([nm, k['ret'], k['vol'], k['sharpe'], k['maxdd'], k['es95'], a])
+
+kpi_matched = pd.DataFrame(rows, columns=["Strategy","Ann.Return","Ann.Vol","Sharpe","MaxDD","ES95_day","Alpha(scale)"])
+kpi_matched.to_csv(os.path.join(OUT_DIR,"m3_kpi_matchedVol.csv"), index=False)
+print("\n=== Model 3 KPIs (risk-matched @ {:.0f}%) ===".format(TARGET_VOL*100))
+print(kpi_matched.to_string(index=False, float_format=lambda x: f"{x:,.4f}"))
+
+# ---------- Net-of-costs grid on risk-matched
+def cost_grid(cost_list):
+    out=[]
+    for c in cost_list:
+        for nm in matched:
+            net = apply_costs(matched[nm], turn_m[nm], c)
+            k = ann_kpis_from_returns(net)
+            out.append([c, nm, k['ret'], k['vol'], k['sharpe'], k['maxdd'], k['es95']])
+    return pd.DataFrame(out, columns=["Cost_bps","Strategy","Ann.Return","Ann.Vol","Sharpe","MaxDD","ES95_day"])
+
+kpi_costs = cost_grid(COST_BPS_GRID)
+kpi_costs.to_csv(os.path.join(OUT_DIR,"m3_kpi_matchedVol_costGrid.csv"), index=False)
+print("\nSaved net-of-costs grid → ./out/m3_kpi_matchedVol_costGrid.csv")
+
+# ---------- Turnover stats
+turn_stats=[]
+for nm, ts in turn_m.items():
+    turn_stats.append([nm, ts.mean(), ts.median(), ts.quantile(0.9), ts.max()])
+turn_df = pd.DataFrame(turn_stats, columns=["Strategy","Turnover_mean","Turnover_median","Turnover_p90","Turnover_max"])
+turn_df.to_csv(os.path.join(OUT_DIR,"m3_turnover_stats.csv"), index=False)
+
+# ---------- Subperiod panels (risk-matched)
+def subperiod_slices(idx):
+    eras=[("2000-01-01","2009-12-31"), ("2010-01-01","2019-12-31"), ("2020-01-01", str(idx.max().date()))]
+    out=[]
+    for s,e in eras:
+        sdt=pd.Timestamp(s); edt=pd.Timestamp(e)
+        mask=(idx>=sdt)&(idx<=edt)
+        if mask.any(): out.append((s,e,mask))
+    return out
+
+subs=[]
+for (s,e,mask) in subperiod_slices(R_aligned.index):
+    for nm in matched:
+        k=ann_kpis_from_returns(matched[nm].loc[mask])
+        subs.append([f"{s}–{e}", nm, k['ret'], k['vol'], k['sharpe'], k['maxdd'], k['es95']])
+sub_df=pd.DataFrame(subs, columns=["Period","Strategy","Ann.Return","Ann.Vol","Sharpe","MaxDD","ES95_day"])
+sub_df.to_csv(os.path.join(OUT_DIR,"m3_kpi_matchedVol_subperiods.csv"), index=False)
+
+# ---------- HMM calibration (one-step-ahead)
+probs = ahead_prob.copy().dropna()
+y_true = labels.reindex(probs.index).shift(-1).dropna()
+probs = probs.loc[y_true.index]
+Y = np.zeros((len(y_true), K))
+for i, y in enumerate(y_true.values.astype(int)):
+    if 0 <= y < K: Y[i, y]=1.0
+P = probs[[f"p{k}" for k in range(K)]].values
+brier = np.mean(np.sum((P - Y)**2, axis=1))
+conf = P.max(axis=1); pred = P.argmax(axis=1); acc = (pred==y_true.values.astype(int)).astype(float)
+bins = np.linspace(0,1,11); ece=0.0
+for b0, b1 in zip(bins[:-1], bins[1:]):
+    idx = (conf>=b0) & (conf<b1)
+    if idx.any():
+        ece += np.mean(idx) * abs(acc[idx].mean() - conf[idx].mean())
+pd.DataFrame({"Metric":["Brier","ECE_top10"], "Value":[brier, ece]}).to_csv(os.path.join(OUT_DIR,"m3_hmm_calibration.csv"), index=False)
+
+# ---------- SAFE turnover distribution (no SciPy KDE)
+def plot_turnover_distribution(turn_map, out_path):
+    fig, ax = plt.subplots(figsize=(10,4))
+    for name, ts in turn_map.items():
+        s = pd.Series(ts).replace([np.inf, -np.inf], np.nan).dropna()
+        s = s[np.isfinite(s)]
+        if (len(s) == 0) or (s.std() <= 1e-12) or (s.nunique() < 3):
+            val = float(s.iloc[0]) if len(s) else 0.0
+            ax.axvline(val, linestyle="--", linewidth=1.5, label=f"{name} (spike)")
+        else:
+            counts, bins = np.histogram(s, bins=40, density=True)
+            centers = 0.5*(bins[1:] + bins[:-1])
+            ax.plot(centers, counts, linewidth=1.5, label=name)
+    ax.set_title("Turnover distribution (one-way, risk-matched)")
+    ax.grid(True); ax.legend()
+    fig.tight_layout(); fig.savefig(out_path, dpi=180)
+
+plot_turnover_distribution(turn_m, os.path.join(OUT_DIR,"m3_fig_turnover_density.png"))
+
+# ---------- Figures (standardized)
+# Risk-matched log cumulative wealth (pre-cost)
+plt.figure(figsize=(10,4))
+for nm, sr in matched.items():
+    curve=(1+sr).cumprod()
+    plt.plot(curve.index, np.log(curve), label=nm)
+plt.title("Log Cumulative Wealth — Risk-matched (10% vol)"); plt.legend(); plt.grid(True, alpha=.3); plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR,"m3_fig_cum_wealth_matched.png"), dpi=180)
+
+# Risk-matched drawdowns
+def ddplot_from_rets(name, rets):
+    curve, dd = smooth_drawdown_from_returns(rets)
+    plt.figure(figsize=(10,3)); plt.plot(dd)
+    plt.title(f"Drawdown (risk-matched) — {name}"); plt.grid(True, alpha=.3); plt.tight_layout()
+    plt.savefig(os.path.join(OUT_DIR, f"m3_fig_drawdown_matched_{name.replace(' ','_').replace('-','')}.png"), dpi=180)
+
+for nm, sr in matched.items():
+    ddplot_from_rets(nm, sr)
+
+# Native wealth (pre-cost)
+curve_prob=(1+ret_prob).cumprod(); curve_mix=(1+ret_mix).cumprod()
+curve_hrp =(1+ret_hrp ).cumprod(); curve_ew=(1+ret_ew).cumprod()
+plt.figure(figsize=(10,4))
+plt.plot(np.log(curve_prob), label="RA-HRP (prob-blend)")
+plt.plot(np.log(curve_mix),  label="RA-HRP (mixture-cov HRP)")
+plt.plot(np.log(curve_hrp),  label=LABEL_HRP)  # keep label "Static HRP"
+plt.plot(np.log(curve_ew),   label="Equal-Weight")
+plt.title("Log Cumulative Wealth — Model 3 (native)"); plt.legend(); plt.grid(True, alpha=.3); plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR,"m3_cum_wealth_native.png"), dpi=180)
+
+# One-step-ahead probability ribbon
+cols=[f"p{k}" for k in range(K)]
+pdf=ahead_prob[cols].dropna(how="any")
+plt.figure(figsize=(12,3.6))
+plt.stackplot(pdf.index, pdf.values.T, labels=cols, alpha=0.9)
+plt.ylim(0,1); plt.title("One-step-ahead Probabilities — Model 3"); plt.legend(ncol=K, fontsize=8, frameon=False)
+plt.grid(True, alpha=.2); plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR,"m3_prob_ribbon.png"), dpi=180)
+
+# Weights timeline (prob-blend portfolio)
+plt.figure(figsize=(11,4))
+plt.stackplot(W_prob.index, W_prob.fillna(method="ffill").values.T, labels=tickers)
+plt.title("Portfolio Weights — RA-HRP (prob-blend)"); plt.legend(loc="upper left", ncol=min(N,4), fontsize=8)
+plt.tight_layout(); plt.savefig(os.path.join(OUT_DIR,"m3_weights_prob_blend.png"), dpi=180)
+
+# ---------- Methods note for reproducibility (kept label "Static HRP")
+pd.DataFrame({
+    "Strategy": [LABEL_HRP],
+    "Method": ["Expanding window, monthly rebalance, Ledoit–Wolf shrinkage, PSD; no look-ahead"]
+}).to_csv(os.path.join(OUT_DIR, "m3_method_notes.csv"), index=False)
+
+print(f"\nFigures & tables saved in: {os.path.abspath(OUT_DIR)}")
+
+#!/usr/bin/env python3
+# Test 8 — IA + HMM (Neural Prior fused with HMM one-step probabilities) — FAIR VERSION
+# --------------------------------------------------------------------------------------
+# Core unchanged:
+# - K=3, ROLL_FIT_N=500, REFIT_EVERY=3
+# - Features x = [log(EW vol, 21d), log(PC1 variance share, 63d)]
+# - HMM on x; Tiny MLP learns P_NN(s_t|x_t) on last train window; Fusion: tempered PoE
+# - Allocation: probabilistic blend of per-regime MV weights from returns
+#
+# Fairness/robustness (like Models 1/2/3):
+# - Add IVP baseline, ES95 metric, risk-matched (10% vol) headline table
+# - Net-of-costs grid (5/10/25/50 bps), subperiod KPIs, turnover stats
+# - SAFE turnover density (no SciPy KDE)
+# - HMM calibration (Brier/ECE) on fused one-step-ahead probs
+# - Data manifest
+#
+# 10% pb fixed for Static MV:
+# - Static MV weights trained once on initial window (no look-ahead), then held
+# - When risk-matching Static MV: cap leverage (ALPHA_CAP_STATIC) and use vol floor
+# --------------------------------------------------------------------------------------
+
+import os, glob, warnings
+warnings.filterwarnings("ignore")
+import numpy as np, pandas as pd, matplotlib.pyplot as plt
+
+DATA_DIR     = "./data2"
+OUT_DIR      = "./out4"
+K            = 3
+ROLL_VOL_N   = 21
+ROLL_PC_WIN  = 63
+ROLL_FIT_N   = 500
+REFIT_EVERY  = 3
+RIDGE        = 1e-6
+CLIP         = 0.5
+SEED         = 7
+
+# IA (NN)
+FUSE_BETA    = 0.40
+NN_HIDDEN    = 16
+NN_EPOCHS    = 80
+NN_LR        = 5e-3
+NN_WEIGHT_DECAY = 1e-4
+NN_DROPOUT   = 0.10
+
+# Fairness/reporting
+TARGET_VOL = 0.10
+COST_BPS_GRID = [5,10,25,50]
+IVP_WIN   = 63
+IVP_REBAL = 21
+
+# Static baseline safeguards (fix the 10% pb)
+STATIC_TRAIN_WIN = 500
+ALPHA_CAP_STATIC = 5.0     # <= 5x scaling max when risk-matching static
+VOL_FLOOR_STATIC = 0.02    # 2% annual vol floor for static risk-matching
+
+np.random.seed(SEED)
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ------------ Imports (hmmlearn + torch) -------------
+try:
+    from hmmlearn.hmm import GaussianHMM
+except Exception as e:
+    raise SystemExit("pip install hmmlearn\nOriginal error: %r" % e)
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+except Exception as e:
+    raise SystemExit("pip install torch\nOriginal error: %r" % e)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+torch.manual_seed(SEED)
+
+# ---------------- Helpers ----------------
+def load_data_from_dir(path):
+    files = sorted(glob.glob(os.path.join(path, "*.csv")))
+    if not files:
+        raise FileNotFoundError(f"No CSVs found in {path}")
+    frames = []
+    for f in files:
+        tkr = os.path.splitext(os.path.basename(f))[0].upper()
+        df = pd.read_csv(f)
+        if "Date" not in df.columns and "date" in df.columns:
+            df.rename(columns={"date":"Date"}, inplace=True)
+        close_col = None
+        for c in ["Close","Adj Close","close","adj_close","AdjClose"]:
+            if c in df.columns:
+                close_col = c; break
+        if close_col is None: 
+            continue
+        df = df[["Date", close_col]].rename(columns={close_col: tkr})
+        df["Date"] = pd.to_datetime(df["Date"])
+        frames.append(df)
+    if not frames: 
+        raise ValueError("No usable files with Close/Adj Close.")
+    out = frames[0]
+    for df in frames[1:]:
+        out = out.merge(df, on="Date", how="outer")
+    out.sort_values("Date", inplace=True)
+    out.set_index("Date", inplace=True)
+    return out.ffill().dropna(how="all")
+
+def to_log_returns(P): return np.log(P/P.shift(1))
+
+def ew_vol_feature(R, n=21):
+    ew = R.mean(axis=1)
+    vol = ew.rolling(n).std()
+    return np.log(vol + 1e-12).rename("x_ewvol")
+
+def pca_pc1_var_feature(R, win=63):
+    from numpy.linalg import eigh
+    vals, idxs = [], []
+    for i in range(win-1, len(R)):
+        X = R.iloc[i-win+1:i+1].dropna(how="any")
+        if len(X) < win: 
+            continue
+        C = X.cov().values
+        evals, _ = eigh(C)  # ascending
+        lam1 = float(evals[-1]); total = float(evals.sum()) + 1e-12
+        vals.append(np.log(lam1/total + 1e-12)); idxs.append(R.index[i])
+    return pd.Series(vals, index=idxs, name="x_pc1")
+
+def ann_kpis_from_returns(rets, freq=252):
+    rets = pd.Series(rets).dropna()
+    if rets.empty: return dict(ret=np.nan, vol=np.nan, sharpe=np.nan, maxdd=np.nan, es95=np.nan)
+    curve=(1+rets).cumprod()
+    maxdd=(curve/curve.cummax()-1).min()
+    ann_ret=(1+rets).prod()**(freq/len(rets)) - 1
+    ann_vol=rets.std()*np.sqrt(freq)
+    sharpe=ann_ret/ann_vol if ann_vol>0 else np.nan
+    q=np.quantile(rets, 0.05)
+    es95 = -rets[rets<=q].mean() if (rets<=q).any() else np.nan
+    return dict(ret=ann_ret, vol=ann_vol, sharpe=sharpe, maxdd=maxdd, es95=es95)
+
+def smooth_drawdown_from_returns(rets):
+    curve=(1+pd.Series(rets).fillna(0)).cumprod()
+    dd=curve/curve.cummax()-1.0
+    return curve, dd
+
+def mean_var_weights(mu, Sigma, ridge=1e-6, clip=0.5):
+    n = len(mu)
+    S = Sigma + ridge*np.eye(n)
+    w = np.linalg.pinv(S).dot(mu.reshape(-1,1)).ravel()
+    w = w/np.abs(w).sum() if np.abs(w).sum()>0 else np.ones(n)/n
+    w = np.clip(w, -clip, clip)
+    w = w/np.abs(w).sum() if np.abs(w).sum()>0 else np.ones(n)/n
+    return w
+
+def inverse_vol_weights(R_window: pd.DataFrame):
+    vol = R_window.std().replace(0, np.nan)
+    w = 1.0/vol
+    w = w.replace([np.inf,-np.inf], np.nan).fillna(0.0)
+    if w.sum()>0: w = w/w.sum()
+    else: w = pd.Series(np.ones(len(R_window.columns))/len(R_window.columns), index=R_window.columns)
+    return w.values
+
+def turnover_series(W: pd.DataFrame):
+    Wf=W.fillna(method="ffill").fillna(0.0)
+    dW=(Wf - Wf.shift(1)).abs().sum(axis=1)*0.5
+    dW.iloc[0]=0.0
+    return dW
+
+def apply_costs(gross: pd.Series, turnover: pd.Series, cost_bps: float):
+    c=cost_bps/10000.0
+    return gross - c*turnover
+
+def risk_match(rets: pd.Series, target_vol=0.10, freq=252, alpha_max=np.inf, vol_floor=0.0):
+    vol = rets.std()*np.sqrt(freq)
+    if not np.isfinite(vol) or vol<=0: return rets.copy(), 1.0
+    denom = max(vol, vol_floor)
+    alpha = target_vol / denom
+    if np.isfinite(alpha_max): alpha = min(alpha, alpha_max)
+    return rets*alpha, alpha
+
+# ---------------- IA (tiny MLP) ----------------
+class TinyMLP(nn.Module):
+    def __init__(self, in_dim, out_dim, hid=16, p=0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hid), nn.ReLU(),
+            nn.Dropout(p),
+            nn.Linear(hid, hid), nn.ReLU(),
+            nn.Dropout(p),
+            nn.Linear(hid, out_dim)
+        )
+    def forward(self, x):  # logits
+        return self.net(x)
+
+@torch.no_grad()
+def nn_predict_proba(model, X):
+    model.eval()
+    logits = model(torch.as_tensor(X, dtype=torch.float32, device=DEVICE))
+    probs = torch.softmax(logits, dim=-1).cpu().numpy()
+    return probs
+
+def nn_train(model, X, y, epochs=80, lr=5e-3, wd=1e-4):
+    model.train()
+    X_t = torch.as_tensor(X, dtype=torch.float32, device=DEVICE)
+    y_t = torch.as_tensor(y, dtype=torch.long, device=DEVICE)
+    opt = optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+    loss_fn = nn.CrossEntropyLoss()
+    for _ in range(epochs):
+        opt.zero_grad()
+        logits = model(X_t)
+        loss = loss_fn(logits, y_t)
+        loss.backward()
+        opt.step()
+
+# ---------------- Load data & features ----------------
+prices = load_data_from_dir(DATA_DIR)
+R = to_log_returns(prices).dropna()
+N = R.shape[1]
+x_ew = ew_vol_feature(R, n=ROLL_VOL_N)
+x_pc = pca_pc1_var_feature(R, win=ROLL_PC_WIN)
+x_df = pd.concat([x_ew, x_pc], axis=1).dropna()
+R_aligned = R.loc[x_df.index]
+dates = x_df.index
+tickers = list(R_aligned.columns)
+print(f"Loaded {N} assets; feature rows={len(dates)}; features={list(x_df.columns)}")
+
+# Manifest
+manifest = pd.DataFrame({
+    "Ticker": R_aligned.columns,
+    "FirstDate": [R_aligned.index.min()]*N,
+    "LastDate":  [R_aligned.index.max()]*N,
+    "Obs": [R_aligned[c].dropna().shape[0] for c in R_aligned.columns]
+})
+manifest.to_csv(os.path.join(OUT_DIR, "t8_manifest.csv"), index=False)
+
+# ---------------- Rolling IA+HMM ----------------
+labels = pd.Series(index=dates, dtype=int)
+filt_prob = pd.DataFrame(index=dates, columns=[f"p{k}" for k in range(K)], dtype=float)
+ahead_prob = filt_prob.copy()
+fused_prob = filt_prob.copy()
+
+model_hmm = None
+last_fit   = None
+
+# IA model (2→K)
+nn_model = TinyMLP(in_dim=x_df.shape[1], out_dim=K, hid=NN_HIDDEN, p=NN_DROPOUT).to(DEVICE)
+
+for i, dt in enumerate(dates):
+    refit = (last_fit is None) or ((i - last_fit) >= REFIT_EVERY)
+
+    # HMM (train / refit on last 500 obs of features)
+    if refit:
+        start_fit = max(0, i - ROLL_FIT_N)
+        X_fit = x_df.iloc[start_fit:i+1].values
+        if len(X_fit) < max(120, ROLL_FIT_N//4):
+            continue
+        model_hmm = GaussianHMM(n_components=K, covariance_type='diag', n_iter=200, random_state=SEED)
+        model_hmm.fit(X_fit)
+        last_fit = i
+
+        # Obtain teacher labels over the training window for NN (Viterbi path)
+        path_fit = model_hmm.predict(X_fit)
+        # Train NN to predict s_t from x_t
+        try:
+            nn_train(nn_model, X_fit, path_fit, epochs=NN_EPOCHS, lr=NN_LR, wd=NN_WEIGHT_DECAY)
+        except Exception as e:
+            print("NN training skipped due to:", e)
+
+    # Inference on rolling window (for probabilities)
+    start = max(0, i - ROLL_FIT_N)
+    X_win = x_df.iloc[start:i+1].values
+    if len(X_win) < 2:
+        continue
+
+    path = model_hmm.predict(X_win)
+    post = model_hmm.predict_proba(X_win)
+    labels.iloc[i] = path[-1]
+    alpha_t = post[-1]
+    filt_prob.iloc[i] = alpha_t
+    p_hmm_next = alpha_t @ model_hmm.transmat_
+    ahead_prob.iloc[i] = p_hmm_next
+
+    # IA prior for s_{t+1}: predict s_t from x_t, then push through A
+    p_nn_t = nn_predict_proba(nn_model, X_win[-1:].copy())[0]     # P_NN(s_t | x_t)
+    p_nn_next = p_nn_t @ model_hmm.transmat_
+
+    # Fuse (tempered product of experts)
+    eps = 1e-12
+    fused = (p_hmm_next + eps)**(1.0 - FUSE_BETA) * (p_nn_next + eps)**(FUSE_BETA)
+    fused = fused / fused.sum()
+    fused_prob.iloc[i] = fused
+
+# ---- Remap states calm→mid→stress by feature stress score
+stress_score = (x_df["x_ewvol"] - x_df["x_ewvol"].mean())/(x_df["x_ewvol"].std()+1e-12) + \
+               (x_df["x_pc1"]  - x_df["x_pc1"].mean()) /(x_df["x_pc1"].std() +1e-12)
+means = [(k, stress_score[labels==k].mean()) for k in range(K)]
+order = [k for (k, _) in sorted(means, key=lambda z:z[1])]
+remap = {old:new for new, old in enumerate(order)}
+labels     = labels.map(remap)
+filt_prob  = filt_prob.rename(columns={f"p{old}":f"p{remap[old]}" for old in range(K)})
+ahead_prob = ahead_prob.rename(columns={f"p{old}":f"p{remap[old]}" for old in range(K)})
+fused_prob = fused_prob.rename(columns={f"p{old}":f"p{remap[old]}" for old in range(K)})
+
+# ---------------- Per-regime weights (MV, NON-CAUSAL, like others) ----------------
+def regime_weights_from_labels(R, labels, ridge=1e-6, clip=0.5):
+    N = R.shape[1]; out = {}
+    for k in sorted(labels.dropna().unique()):
+        idx = labels.index[labels==k]
+        if len(idx) < max(60, N*5):
+            out[int(k)] = np.ones(N)/N
+        else:
+            sub = R.loc[idx]
+            mu = sub.mean().values
+            Sigma = sub.cov().values
+            out[int(k)] = mean_var_weights(mu, Sigma, ridge=ridge, clip=clip)
+    return out
+
+regime_w = regime_weights_from_labels(R_aligned, labels, RIDGE, CLIP)
+
+# ---------------- Portfolio from fused probabilities ---------------
+W_fused = pd.DataFrame(index=R_aligned.index, columns=R_aligned.columns, dtype=float)
+for dt in R_aligned.index:
+    p_row = fused_prob.loc[dt]
+    if p_row.isna().any():
+        W_fused.loc[dt] = np.ones(N)/N
+        continue
+    w = np.zeros(N)
+    for k in range(K):
+        w += float(p_row[f"p{k}"]) * regime_w.get(k, np.ones(N)/N)
+    w = np.clip(w, -CLIP, CLIP)
+    w = w/np.abs(w).sum() if np.abs(w).sum()>0 else np.ones(N)/N
+    W_fused.loc[dt] = w
+
+ret_fused = (R_aligned * W_fused.shift(1)).sum(axis=1).fillna(0.0)
+turn_fused = turnover_series(W_fused)
+
+# ---------------- Baselines ----------------
+# Equal-Weight
+w_ew = np.ones(N)/N
+W_ew = pd.DataFrame([w_ew]*len(R_aligned), index=R_aligned.index, columns=R_aligned.columns)
+ret_ew = (R_aligned @ pd.Series(w_ew, index=R_aligned.columns)).fillna(0.0)
+turn_ew = turnover_series(W_ew)
+
+# Static MV — FIXED (train once on initial window; held constant)
+train_n = min(STATIC_TRAIN_WIN, len(R_aligned))
+Sigma_train = R_aligned.iloc[:train_n].cov().values
+mu_train    = R_aligned.iloc[:train_n].mean().values
+w_static    = mean_var_weights(mu_train, Sigma_train, ridge=RIDGE, clip=CLIP)
+W_static = pd.DataFrame([w_static]*len(R_aligned), index=R_aligned.index, columns=R_aligned.columns)
+ret_static = (R_aligned @ pd.Series(w_static, index=R_aligned.columns)).fillna(0.0)
+turn_static = turnover_series(W_static)
+
+# Constant-Vol Risk-Parity (IVP), rolling
+W_ivp = pd.DataFrame(index=R_aligned.index, columns=R_aligned.columns, dtype=float)
+for i, dt in enumerate(R_aligned.index):
+    if i<IVP_WIN:
+        W_ivp.iloc[i]=np.ones(N)/N
+    else:
+        if i % IVP_REBAL == 0 or i == IVP_WIN:
+            Rw=R_aligned.iloc[i-IVP_WIN:i]
+            W_ivp.iloc[i]=inverse_vol_weights(Rw)
+        else:
+            W_ivp.iloc[i]=W_ivp.iloc[i-1]
+W_ivp=W_ivp.fillna(method="ffill").fillna(1.0/N)
+ret_ivp=(R_aligned * W_ivp.shift(1)).sum(axis=1).fillna(0.0)
+turn_ivp = turnover_series(W_ivp)
+
+# ---------------- KPIs (native, pre-cost) ----------------
+def krow(name, rets):
+    k=ann_kpis_from_returns(rets)
+    return [name, k['ret'], k['vol'], k['sharpe'], k['maxdd'], k['es95']]
+
+kpi_native = pd.DataFrame(
+    [krow("Equal-Weight", ret_ew),
+     krow("Static MV", ret_static),
+     krow("IVP (Const-Vol RP, rolling)", ret_ivp),
+     krow("IA+HMM (fused)", ret_fused)],
+    columns=["Strategy","Ann.Return","Ann.Vol","Sharpe","MaxDD","ES95_day"]
+)
+kpi_native.to_csv(os.path.join(OUT_DIR,"t8_kpi_native.csv"), index=False)
+print("\n=== Test 8 KPIs (native, pre-cost) ===")
+print(kpi_native.to_string(index=False, float_format=lambda x: f"{x:,.4f}"))
+
+# ---------------- Risk-matched @ 10% (with static cap/floor) ---------------
+def matched_series_and_alpha(name, rets, turn, *, alpha_max=np.inf, vol_floor=0.0):
+    rm, alpha = risk_match(rets, TARGET_VOL, alpha_max=alpha_max, vol_floor=vol_floor)
+    return name, rm, turn*alpha, alpha, ann_kpis_from_returns(rm)
+
+matched = {}
+turn_m  = {}
+alphas  = {}
+rows=[]
+for name, rets, turn in [
+    ("Equal-Weight", ret_ew, turn_ew),
+    ("Static MV", ret_static, turn_static),
+    ("IVP (Const-Vol RP, rolling)", ret_ivp, turn_ivp),
+    ("IA+HMM (fused)", ret_fused, turn_fused),
+]:
+    if name == "Static MV":
+        nm, rm, tm, a, k = matched_series_and_alpha(name, rets, turn,
+                                                    alpha_max=ALPHA_CAP_STATIC,
+                                                    vol_floor=VOL_FLOOR_STATIC)
+    else:
+        nm, rm, tm, a, k = matched_series_and_alpha(name, rets, turn)
+    matched[nm]=rm; turn_m[nm]=tm; alphas[nm]=a
+    rows.append([nm, k['ret'], k['vol'], k['sharpe'], k['maxdd'], k['es95'], a])
+
+kpi_matched = pd.DataFrame(rows, columns=["Strategy","Ann.Return","Ann.Vol","Sharpe","MaxDD","ES95_day","Alpha(scale)"])
+kpi_matched.to_csv(os.path.join(OUT_DIR,"t8_kpi_matchedVol.csv"), index=False)
+print("\n=== Test 8 KPIs (risk-matched @ {:.0f}%) ===".format(TARGET_VOL*100))
+print(kpi_matched.to_string(index=False, float_format=lambda x: f"{x:,.4f}"))
+
+# ---------------- Net-of-costs grid ---------------------------------------
+def cost_grid(cost_list):
+    out=[]
+    for c in cost_list:
+        for nm in matched:
+            net = apply_costs(matched[nm], turn_m[nm], c)
+            k = ann_kpis_from_returns(net)
+            out.append([c, nm, k['ret'], k['vol'], k['sharpe'], k['maxdd'], k['es95']])
+    return pd.DataFrame(out, columns=["Cost_bps","Strategy","Ann.Return","Ann.Vol","Sharpe","MaxDD","ES95_day"])
+
+kpi_costs = cost_grid(COST_BPS_GRID)
+kpi_costs.to_csv(os.path.join(OUT_DIR,"t8_kpi_matchedVol_costGrid.csv"), index=False)
+print("\nSaved net-of-costs grid → ./out/t8_kpi_matchedVol_costGrid.csv")
+
+# ---------------- Turnover stats & SAFE density plot -----------------------
+turn_stats=[]
+for nm, ts in turn_m.items():
+    turn_stats.append([nm, ts.mean(), ts.median(), ts.quantile(0.9), ts.max()])
+turn_df = pd.DataFrame(turn_stats, columns=["Strategy","Turnover_mean","Turnover_median","Turnover_p90","Turnover_max"])
+turn_df.to_csv(os.path.join(OUT_DIR,"t8_turnover_stats.csv"), index=False)
+
+def plot_turnover_distribution(turn_map, out_path):
+    fig, ax = plt.subplots(figsize=(10,4))
+    for name, ts in turn_map.items():
+        s = pd.Series(ts).replace([np.inf, -np.inf], np.nan).dropna()
+        s = s[np.isfinite(s)]
+        if (len(s) == 0) or (s.std() <= 1e-12) or (s.nunique() < 3):
+            val = float(s.iloc[0]) if len(s) else 0.0
+            ax.axvline(val, linestyle="--", linewidth=1.5, label=f"{name} (spike)")
+        else:
+            counts, bins = np.histogram(s, bins=40, density=True)
+            centers = 0.5*(bins[1:] + bins[:-1])
+            ax.plot(centers, counts, linewidth=1.5, label=name)
+    ax.set_title("Turnover distribution (one-way, risk-matched)")
+    ax.grid(True); ax.legend()
+    fig.tight_layout(); fig.savefig(out_path, dpi=180)
+
+plot_turnover_distribution(turn_m, os.path.join(OUT_DIR,"t8_fig_turnover_density.png"))
+
+# ---------------- Subperiod KPIs (risk-matched) ----------------------------
+def subperiod_slices(idx):
+    eras=[("2000-01-01","2009-12-31"), ("2010-01-01","2019-12-31"), ("2020-01-01", str(idx.max().date()))]
+    out=[]
+    for s,e in eras:
+        sdt=pd.Timestamp(s); edt=pd.Timestamp(e)
+        mask=(idx>=sdt)&(idx<=edt)
+        if mask.any(): out.append((s,e,mask))
+    return out
+
+subs=[]
+for (s,e,mask) in subperiod_slices(R_aligned.index):
+    for nm in matched:
+        k=ann_kpis_from_returns(matched[nm].loc[mask])
+        subs.append([f"{s}–{e}", nm, k['ret'], k['vol'], k['sharpe'], k['maxdd'], k['es95']])
+sub_df=pd.DataFrame(subs, columns=["Period","Strategy","Ann.Return","Ann.Vol","Sharpe","MaxDD","ES95_day"])
+sub_df.to_csv(os.path.join(OUT_DIR,"t8_kpi_matchedVol_subperiods.csv"), index=False)
+
+# ---------------- HMM calibration (one-step-ahead, fused) ------------------
+probs = fused_prob.copy().dropna()
+y_true = labels.reindex(probs.index).shift(-1).dropna()
+probs = probs.loc[y_true.index]
+Y = np.zeros((len(y_true), K))
+for i, y in enumerate(y_true.values.astype(int)):
+    if 0 <= y < K: Y[i, y]=1.0
+P = probs[[f"p{k}" for k in range(K)]].values
+brier = np.mean(np.sum((P - Y)**2, axis=1))
+conf = P.max(axis=1); pred = P.argmax(axis=1); acc = (pred==y_true.values.astype(int)).astype(float)
+bins = np.linspace(0,1,11); ece=0.0
+for b0, b1 in zip(bins[:-1], bins[1:]):
+    idx = (conf>=b0) & (conf<b1)
+    if idx.any():
+        ece += np.mean(idx) * abs(acc[idx].mean() - conf[idx].mean())
+pd.DataFrame({"Metric":["Brier","ECE_top10"], "Value":[brier, ece]}).to_csv(os.path.join(OUT_DIR,"t8_hmm_calibration.csv"), index=False)
+
+# ---------------- Figures ---------------------------------------------------
+# Risk-matched log cumulative wealth (pre-cost)
+plt.figure(figsize=(10,4))
+for nm, sr in matched.items():
+    curve=(1+sr).cumprod()
+    plt.plot(curve.index, np.log(curve), label=nm)
+plt.title("Log Cumulative Wealth — Risk-matched (10% vol)")  # Static may be <10% if capped
+plt.legend(); plt.grid(True, alpha=.3); plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR,"t8_fig_cum_wealth_matched.png"), dpi=180)
+
+# Risk-matched drawdowns
+def ddplot_from_rets(name, rets):
+    curve, dd = smooth_drawdown_from_returns(rets)
+    plt.figure(figsize=(10,3)); plt.plot(dd)
+    plt.title(f"Drawdown (risk-matched) — {name}"); plt.grid(True, alpha=.3); plt.tight_layout()
+    plt.savefig(os.path.join(OUT_DIR, f"t8_fig_drawdown_matched_{name.replace(' ','_').replace('-','')}.png"), dpi=180)
+
+for nm, sr in matched.items():
+    ddplot_from_rets(nm, sr)
+
+# Native wealth (pre-cost)
+curve_fused=(1+ret_fused).cumprod(); curve_static=(1+ret_static).cumprod()
+curve_ivp=(1+ret_ivp).cumprod(); curve_ew=(1+ret_ew).cumprod()
+plt.figure(figsize=(10,4))
+plt.plot(np.log(curve_fused),  label="IA+HMM (fused)")
+plt.plot(np.log(curve_static), label="Static MV")
+plt.plot(np.log(curve_ivp),    label="IVP (rolling)")
+plt.plot(np.log(curve_ew),     label="Equal-Weight")
+plt.title("Log Cumulative Wealth — Test 8 (native)"); plt.legend(); plt.grid(True, alpha=.3); plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR,"t8_cum_wealth_native.png"), dpi=180)
+
+# Probability ribbon (fused)
+cols=[f"p{k}" for k in range(K)]
+pdf=fused_prob[cols].dropna(how="any")
+plt.figure(figsize=(12,3.6))
+plt.stackplot(pdf.index, pdf.values.T, labels=cols, alpha=0.9)
+plt.ylim(0,1); plt.title("One-step-ahead Probabilities — IA+HMM (fused)"); plt.legend(ncol=K, fontsize=8, frameon=False)
+plt.grid(True, alpha=.2); plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR,"t8_prob_ribbon.png"), dpi=180)
+
+# Weights timeline (fused)
+plt.figure(figsize=(11,4))
+plt.stackplot(W_fused.index, W_fused.fillna(method="ffill").values.T, labels=tickers)
+plt.title("Portfolio Weights — IA+HMM (fused)"); plt.legend(loc="upper left", ncol=min(N,4), fontsize=8)
+plt.tight_layout(); plt.savefig(os.path.join(OUT_DIR,"t8_weights_fused.png"), dpi=180)
+
+print(f"\nFigures & tables saved in: {os.path.abspath(OUT_DIR)}")
