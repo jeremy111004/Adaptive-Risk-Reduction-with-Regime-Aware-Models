@@ -1,6 +1,4 @@
-Got it — here’s a **concise and clean README.md** tailored to your exact setup (these 13 ETFs in `/data2`, raw code scripts, minimal infra):
 
----
 
 # Adaptive Risk Reduction with Regime-Aware Models
 
